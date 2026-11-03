@@ -1,3 +1,4 @@
+
 package com.gunmubei.lsposed;
 
 import android.util.Log;
@@ -11,15 +12,17 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
-import java.util.Collections;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.Locale;
-import java.util.Map;
-import java.util.WeakHashMap;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -54,16 +57,10 @@ final class SystemServerHookInstaller {
 
     private final ClassLoader classLoader;
 
-    /*
-     * 日志单线程执行器。
-     *
-     * Hook 回调只采集数据并提交日志，
-     * 不在 system_server 原始调用线程中执行文件 I/O。
-     */
     private final ThreadPoolExecutor logExecutor;
 
     /*
-     * 文件日志状态只允许日志执行器线程访问。
+     * 以下日志文件状态只由日志执行器线程访问。
      */
     private BufferedWriter fileLogWriter;
 
@@ -80,15 +77,21 @@ final class SystemServerHookInstaller {
     private int installedCount;
 
     /*
-     * WPC 快照去重缓存。
+     * 弱引用 + 对象身份比较的快照缓存。
      *
-     * 使用 WeakHashMap，避免缓存长期强引用 WPC。
-     * 同步 Map，保证不同 Hook 回调访问时的线程安全。
+     * 不使用 WeakHashMap 的 equals/hashCode 语义。
+     * 不强引用 WPC，避免缓存阻止对象回收。
      */
-    private final Map<Object, String> lastWpcSnapshots =
-            Collections.synchronizedMap(
-                    new WeakHashMap<>()
-            );
+    private final WeakIdentitySnapshotCache lastWpcSnapshots =
+            new WeakIdentitySnapshotCache();
+
+    /*
+     * 状态字段读取失败诊断去重。
+     *
+     * 同一个字段只报告一次，避免高频 Hook 刷屏。
+     */
+    private final Set<String> reportedStateReadFailures =
+            ConcurrentHashMap.newKeySet();
 
     SystemServerHookInstaller(
             ModuleEntry module,
@@ -96,6 +99,7 @@ final class SystemServerHookInstaller {
     ) {
 
         this.module = module;
+
         this.classLoader = classLoader;
 
         this.logExecutor = new ThreadPoolExecutor(
@@ -126,6 +130,27 @@ final class SystemServerHookInstaller {
                 },
                 new ThreadPoolExecutor.DiscardOldestPolicy()
         );
+
+        /*
+         * 每次 system_server 启动时重置日志文件。
+         *
+         * 该任务先于 install() 中提交的 Hook 日志进入队列，
+         * 因此正常情况下会先删除旧日志并创建新日志。
+         */
+        try {
+
+            logExecutor.execute(
+                    this::resetLogFileForBoot
+            );
+
+        } catch (RuntimeException error) {
+
+            module.safeLog(
+                    Log.ERROR,
+                    "Cannot schedule boot log reset",
+                    error
+            );
+        }
     }
 
     /**
@@ -133,7 +158,6 @@ final class SystemServerHookInstaller {
      */
     void install() {
 
-        // Tracker：整体可见性上升沿。
         hookAfter(
                 TRACKER,
                 "onAnyActivityVisible",
@@ -144,7 +168,6 @@ final class SystemServerHookInstaller {
                 )
         );
 
-        // Tracker：整体可见性下降沿。
         hookAfter(
                 TRACKER,
                 "onAllActivitiesInvisible",
@@ -155,7 +178,6 @@ final class SystemServerHookInstaller {
                 )
         );
 
-        // WPC：进程 Activity 状态重新计算完成。
         hookAfter(
                 WPC,
                 "computeProcessActivityState",
@@ -167,18 +189,15 @@ final class SystemServerHookInstaller {
         );
 
         /*
-         * ATS：可见性事务结束。
-         *
-         * 保留原 Hook 点位。
-         * 不再记录全系统 depth=0 事件，
-         * 避免无关应用产生大量日志。
+         * 保留 ATS Hook 点位。
+         * 不输出全系统事务日志，避免刷屏。
          */
         hookAfter(
                 ATS,
                 "endActivityVisibilityUpdate",
                 new String[0],
                 chain -> {
-                    // 仅观察 Hook 是否正常触发，不输出全局事务日志。
+                    // 当前阶段不需要记录全局事务事件。
                 }
         );
 
@@ -246,6 +265,108 @@ final class SystemServerHookInstaller {
     }
 
     /**
+     * 每次 system_server 启动时：
+     *
+     * 1. 删除旧日志。
+     * 2. 创建父目录（不存在时）。
+     * 3. 创建新的空日志文件。
+     * 4. 打开追加写入流。
+     *
+     * 只允许日志执行器线程调用。
+     */
+    private void resetLogFileForBoot() {
+
+        try {
+
+            File parent = LOG_FILE.getParentFile();
+
+            if (parent == null) {
+
+                throw new IOException(
+                        "Log parent directory is null"
+                );
+            }
+
+            if (!parent.exists()) {
+
+                if (!parent.mkdirs()
+                        && !parent.isDirectory()) {
+
+                    throw new IOException(
+                            "Cannot create log directory: "
+                                    + parent.getAbsolutePath()
+                    );
+                }
+            }
+
+            if (!parent.isDirectory()) {
+
+                throw new IOException(
+                        "Log parent is not a directory: "
+                                + parent.getAbsolutePath()
+                );
+            }
+
+            /*
+             * 旧文件存在时先删除。
+             */
+            if (LOG_FILE.exists()) {
+
+                if (!LOG_FILE.isFile()) {
+
+                    throw new IOException(
+                            "Log path exists but is not a file: "
+                                    + LOG_FILE.getAbsolutePath()
+                    );
+                }
+
+                if (!LOG_FILE.delete()) {
+
+                    throw new IOException(
+                            "Cannot delete previous log file: "
+                                    + LOG_FILE.getAbsolutePath()
+                    );
+                }
+            }
+
+            /*
+             * 创建新日志文件。
+             */
+            if (!LOG_FILE.createNewFile()
+                    && !LOG_FILE.isFile()) {
+
+                throw new IOException(
+                        "Cannot create log file: "
+                                + LOG_FILE.getAbsolutePath()
+                );
+            }
+
+            /*
+             * 文件已创建，使用追加模式打开。
+             */
+            fileLogWriter = new BufferedWriter(
+                    new OutputStreamWriter(
+                            new FileOutputStream(LOG_FILE, true),
+                            StandardCharsets.UTF_8
+                    )
+            );
+
+            fileLogDisabled = false;
+
+            module.safeLog(
+                    Log.INFO,
+                    "Log file reset successfully: "
+                            + LOG_FILE.getAbsolutePath(),
+                    null
+            );
+
+        } catch (Throwable error) {
+
+            disableFileLogging(error);
+        }
+    }
+
+    /**
      * Hook ProcessStateRecord 的状态设置方法。
      *
      * 原方法执行前读取旧状态，
@@ -290,13 +411,15 @@ final class SystemServerHookInstaller {
                                     fieldName,
                                     UNKNOWN
                             );
+
+                            if (before == UNKNOWN) {
+                                reportStateReadFailure(fieldName);
+                            }
                         }
 
                         /*
-                         * 必须先执行原方法。
-                         *
-                         * 原方法抛出异常时直接向外传播，
-                         * 不改变原方法异常行为。
+                         * 先执行原方法。
+                         * 原方法异常原样传播。
                          */
                         Object result = chain.proceed();
 
@@ -310,9 +433,12 @@ final class SystemServerHookInstaller {
                                 UNKNOWN
                         );
 
+                        if (after == UNKNOWN) {
+                            reportStateReadFailure(fieldName);
+                        }
+
                         /*
-                         * 读取失败时不猜测状态。
-                         * 只有前后都成功读取且数值不同才记录。
+                         * 只有前后均成功读取且数值不同才记录。
                          */
                         if (before != UNKNOWN
                                 && after != UNKNOWN
@@ -333,6 +459,21 @@ final class SystemServerHookInstaller {
                     });
                 }
         );
+    }
+
+    /**
+     * 同一个字段的读取失败只报告一次。
+     */
+    private void reportStateReadFailure(String fieldName) {
+
+        if (reportedStateReadFailures.add(fieldName)) {
+
+            postLog(
+                    Log.WARN,
+                    "PROCESS_STATE_READ_FAILED field="
+                            + fieldName
+            );
+        }
     }
 
     /**
@@ -397,7 +538,6 @@ final class SystemServerHookInstaller {
                                 );
                             }
 
-                            // 原方法异常原样抛出。
                             throw originalError;
                         }
                     });
@@ -407,9 +547,6 @@ final class SystemServerHookInstaller {
 
     /**
      * 安装 after 型 Hook。
-     *
-     * 先执行原方法。
-     * 观察代码出错时只记录异常，不影响原方法结果。
      */
     private void hookAfter(
             String className,
@@ -452,8 +589,6 @@ final class SystemServerHookInstaller {
 
     /**
      * 根据类名、方法名、参数类型精确寻找方法并安装 Hook。
-     *
-     * 单个 Hook 安装失败不会阻止后续 Hook。
      */
     private void hookMethod(
             String className,
@@ -577,10 +712,8 @@ final class SystemServerHookInstaller {
     /**
      * 记录 WPC 事件。
      *
-     * Tracker 事件是可见性边沿，始终记录。
-     *
-     * WPC_COMPUTE 是高频计算事件，
-     * 只有快照发生变化才记录。
+     * Tracker 边沿事件始终记录。
+     * WPC_COMPUTE 只有快照变化才记录。
      */
     private void logWpcEvent(
             String event,
@@ -599,21 +732,17 @@ final class SystemServerHookInstaller {
 
         if ("WPC_COMPUTE".equals(event)) {
 
-            String previous;
+            String previous =
+                    lastWpcSnapshots.get(wpc);
 
-            synchronized (lastWpcSnapshots) {
-
-                previous = lastWpcSnapshots.get(wpc);
-
-                if (snapshot.equals(previous)) {
-                    return;
-                }
-
-                lastWpcSnapshots.put(
-                        wpc,
-                        snapshot
-                );
+            if (snapshot.equals(previous)) {
+                return;
             }
+
+            lastWpcSnapshots.put(
+                    wpc,
+                    snapshot
+            );
 
             postLog(
                     Log.INFO,
@@ -626,7 +755,6 @@ final class SystemServerHookInstaller {
             return;
         }
 
-        // Tracker 边沿事件不参与去重。
         postLog(
                 Log.INFO,
                 ProcessSnapshot.describeWpc(
@@ -681,22 +809,17 @@ final class SystemServerHookInstaller {
             Throwable throwable
     ) {
 
-        // 保留 LSPosed 原生日志。
         module.safeLog(
                 priority,
                 message,
                 throwable
         );
 
-        if (fileLogDisabled) {
+        if (fileLogDisabled || fileLogWriter == null) {
             return;
         }
 
         try {
-
-            if (fileLogWriter == null) {
-                openLogFile();
-            }
 
             fileLogWriter.write("[");
             fileLogWriter.write(
@@ -743,51 +866,7 @@ final class SystemServerHookInstaller {
     }
 
     /**
-     * 创建日志目录并以追加模式打开日志文件。
-     */
-    private void openLogFile() throws IOException {
-
-        File parent = LOG_FILE.getParentFile();
-
-        if (parent == null) {
-
-            throw new IOException(
-                    "Log parent directory is null"
-            );
-        }
-
-        if (!parent.exists()) {
-
-            if (!parent.mkdirs() && !parent.isDirectory()) {
-
-                throw new IOException(
-                        "Cannot create log directory: "
-                                + parent.getAbsolutePath()
-                );
-            }
-        }
-
-        if (!parent.isDirectory()) {
-
-            throw new IOException(
-                    "Log parent is not a directory: "
-                            + parent.getAbsolutePath()
-            );
-        }
-
-        fileLogWriter = new BufferedWriter(
-                new OutputStreamWriter(
-                        new FileOutputStream(LOG_FILE, true),
-                        StandardCharsets.UTF_8
-                )
-        );
-    }
-
-    /**
      * 文件日志不可用时关闭 Writer。
-     *
-     * 只向 LSPosed 原生日志报告一次，
-     * 防止文件权限错误造成无限日志递归。
      */
     private void disableFileLogging(Throwable error) {
 
@@ -842,6 +921,102 @@ final class SystemServerHookInstaller {
 
             default:
                 return Integer.toString(priority);
+        }
+    }
+
+    /**
+     * 弱引用对象身份快照缓存。
+     *
+     * 使用 == 比较对象身份，不调用 equals/hashCode。
+     * 每次操作都会清理已经回收的 WPC 引用。
+     */
+    private static final class WeakIdentitySnapshotCache {
+
+        private final ArrayList<SnapshotEntry> entries =
+                new ArrayList<>();
+
+        synchronized String get(Object key) {
+
+            if (key == null) {
+                return null;
+            }
+
+            String result = null;
+
+            Iterator<SnapshotEntry> iterator =
+                    entries.iterator();
+
+            while (iterator.hasNext()) {
+
+                SnapshotEntry entry = iterator.next();
+
+                Object current = entry.reference.get();
+
+                if (current == null) {
+
+                    iterator.remove();
+                    continue;
+                }
+
+                if (current == key) {
+                    result = entry.snapshot;
+                }
+            }
+
+            return result;
+        }
+
+        synchronized void put(
+                Object key,
+                String snapshot
+        ) {
+
+            if (key == null) {
+                return;
+            }
+
+            Iterator<SnapshotEntry> iterator =
+                    entries.iterator();
+
+            while (iterator.hasNext()) {
+
+                SnapshotEntry entry = iterator.next();
+
+                Object current = entry.reference.get();
+
+                if (current == null) {
+
+                    iterator.remove();
+                    continue;
+                }
+
+                if (current == key) {
+
+                    entry.snapshot = snapshot;
+                    return;
+                }
+            }
+
+            entries.add(
+                    new SnapshotEntry(key, snapshot)
+            );
+        }
+    }
+
+    private static final class SnapshotEntry {
+
+        final WeakReference<Object> reference;
+
+        String snapshot;
+
+        SnapshotEntry(
+                Object key,
+                String snapshot
+        ) {
+
+            this.reference = new WeakReference<>(key);
+
+            this.snapshot = snapshot;
         }
     }
 
