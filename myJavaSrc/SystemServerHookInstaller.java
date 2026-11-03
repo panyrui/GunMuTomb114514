@@ -53,15 +53,14 @@ final class SystemServerHookInstaller {
     private static final int UNKNOWN =
             Integer.MIN_VALUE;
 
+    private static final long NS_PER_MS = 1_000_000L;
+
     private final ModuleEntry module;
 
     private final ClassLoader classLoader;
 
     private final ThreadPoolExecutor logExecutor;
 
-    /*
-     * 以下日志文件状态只由日志执行器线程访问。
-     */
     private BufferedWriter fileLogWriter;
 
     private boolean fileLogDisabled;
@@ -76,20 +75,9 @@ final class SystemServerHookInstaller {
 
     private int installedCount;
 
-    /*
-     * 弱引用 + 对象身份比较的快照缓存。
-     *
-     * 不使用 WeakHashMap 的 equals/hashCode 语义。
-     * 不强引用 WPC，避免缓存阻止对象回收。
-     */
     private final WeakIdentitySnapshotCache lastWpcSnapshots =
             new WeakIdentitySnapshotCache();
 
-    /*
-     * 状态字段读取失败诊断去重。
-     *
-     * 同一个字段只报告一次，避免高频 Hook 刷屏。
-     */
     private final Set<String> reportedStateReadFailures =
             ConcurrentHashMap.newKeySet();
 
@@ -99,7 +87,6 @@ final class SystemServerHookInstaller {
     ) {
 
         this.module = module;
-
         this.classLoader = classLoader;
 
         this.logExecutor = new ThreadPoolExecutor(
@@ -121,7 +108,7 @@ final class SystemServerHookInstaller {
                         thread.setDaemon(true);
 
                         try {
-                            thread.setPriority(Thread.MIN_PRIORITY);
+                            thread.setPriority(Thread.NORM_PRIORITY);
                         } catch (SecurityException ignored) {
                         }
 
@@ -131,12 +118,6 @@ final class SystemServerHookInstaller {
                 new ThreadPoolExecutor.DiscardOldestPolicy()
         );
 
-        /*
-         * 每次 system_server 启动时重置日志文件。
-         *
-         * 该任务先于 install() 中提交的 Hook 日志进入队列，
-         * 因此正常情况下会先删除旧日志并创建新日志。
-         */
         try {
 
             logExecutor.execute(
@@ -153,9 +134,6 @@ final class SystemServerHookInstaller {
         }
     }
 
-    /**
-     * 安装全部观察型 Hook。
-     */
     void install() {
 
         hookAfter(
@@ -188,20 +166,15 @@ final class SystemServerHookInstaller {
                 )
         );
 
-        /*
-         * 保留 ATS Hook 点位。
-         * 不输出全系统事务日志，避免刷屏。
-         */
         hookAfter(
                 ATS,
                 "endActivityVisibilityUpdate",
                 new String[0],
                 chain -> {
-                    // 当前阶段不需要记录全局事务事件。
+                    // 当前阶段不记录全局事务事件。
                 }
         );
 
-        // ProcessRecord：PID 更新。
         hookAfter(
                 PROCESS_RECORD,
                 "setPid",
@@ -237,17 +210,14 @@ final class SystemServerHookInstaller {
                 }
         );
 
-        // ProcessRecord：清理过程。
         hookCleanup();
 
-        // ProcessStateRecord：当前进程状态变化。
         hookProcessStateSetter(
                 "setCurProcState",
                 "mCurProcState",
                 "PROCESS_STATE_CUR"
         );
 
-        // ProcessStateRecord：已提交进程状态变化。
         hookProcessStateSetter(
                 "setSetProcState",
                 "mSetProcState",
@@ -264,16 +234,6 @@ final class SystemServerHookInstaller {
         );
     }
 
-    /**
-     * 每次 system_server 启动时：
-     *
-     * 1. 删除旧日志。
-     * 2. 创建父目录（不存在时）。
-     * 3. 创建新的空日志文件。
-     * 4. 打开追加写入流。
-     *
-     * 只允许日志执行器线程调用。
-     */
     private void resetLogFileForBoot() {
 
         try {
@@ -307,9 +267,6 @@ final class SystemServerHookInstaller {
                 );
             }
 
-            /*
-             * 旧文件存在时先删除。
-             */
             if (LOG_FILE.exists()) {
 
                 if (!LOG_FILE.isFile()) {
@@ -329,9 +286,6 @@ final class SystemServerHookInstaller {
                 }
             }
 
-            /*
-             * 创建新日志文件。
-             */
             if (!LOG_FILE.createNewFile()
                     && !LOG_FILE.isFile()) {
 
@@ -341,9 +295,6 @@ final class SystemServerHookInstaller {
                 );
             }
 
-            /*
-             * 文件已创建，使用追加模式打开。
-             */
             fileLogWriter = new BufferedWriter(
                     new OutputStreamWriter(
                             new FileOutputStream(LOG_FILE, true),
@@ -366,14 +317,6 @@ final class SystemServerHookInstaller {
         }
     }
 
-    /**
-     * Hook ProcessStateRecord 的状态设置方法。
-     *
-     * 原方法执行前读取旧状态，
-     * 原方法执行后读取新状态。
-     *
-     * 只有字段真实发生变化才输出日志。
-     */
     private void hookProcessStateSetter(
             String methodName,
             String fieldName,
@@ -417,10 +360,6 @@ final class SystemServerHookInstaller {
                             }
                         }
 
-                        /*
-                         * 先执行原方法。
-                         * 原方法异常原样传播。
-                         */
                         Object result = chain.proceed();
 
                         if (!target) {
@@ -437,9 +376,6 @@ final class SystemServerHookInstaller {
                             reportStateReadFailure(fieldName);
                         }
 
-                        /*
-                         * 只有前后均成功读取且数值不同才记录。
-                         */
                         if (before != UNKNOWN
                                 && after != UNKNOWN
                                 && before != after) {
@@ -461,9 +397,6 @@ final class SystemServerHookInstaller {
         );
     }
 
-    /**
-     * 同一个字段的读取失败只报告一次。
-     */
     private void reportStateReadFailure(String fieldName) {
 
         if (reportedStateReadFailures.add(fieldName)) {
@@ -476,12 +409,6 @@ final class SystemServerHookInstaller {
         }
     }
 
-    /**
-     * Hook ProcessRecord.onCleanupApplicationRecordLSP。
-     *
-     * 在原方法执行前保存身份信息，
-     * 因为原方法内部会清理包列表。
-     */
     private void hookCleanup() {
 
         hookMethod(
@@ -545,9 +472,6 @@ final class SystemServerHookInstaller {
         );
     }
 
-    /**
-     * 安装 after 型 Hook。
-     */
     private void hookAfter(
             String className,
             String methodName,
@@ -587,9 +511,6 @@ final class SystemServerHookInstaller {
         );
     }
 
-    /**
-     * 根据类名、方法名、参数类型精确寻找方法并安装 Hook。
-     */
     private void hookMethod(
             String className,
             String methodName,
@@ -709,12 +630,6 @@ final class SystemServerHookInstaller {
         }
     }
 
-    /**
-     * 记录 WPC 事件。
-     *
-     * Tracker 边沿事件始终记录。
-     * WPC_COMPUTE 只有快照变化才记录。
-     */
     private void logWpcEvent(
             String event,
             Object wpc
@@ -766,6 +681,11 @@ final class SystemServerHookInstaller {
 
     /**
      * 异步提交日志。
+     *
+     * eventTimeNs：调用 postLog 时记录的时间。
+     * enqueueTimeNs：任务提交队列前记录的时间。
+     *
+     * 两个时间点都使用单调时钟。
      */
     private void postLog(
             int priority,
@@ -781,13 +701,18 @@ final class SystemServerHookInstaller {
             Throwable throwable
     ) {
 
+        final long eventTimeNs = System.nanoTime();
+        final long enqueueTimeNs = System.nanoTime();
+
         try {
 
             logExecutor.execute(
                     () -> writeLog(
                             priority,
                             message,
-                            throwable
+                            throwable,
+                            eventTimeNs,
+                            enqueueTimeNs
                     )
             );
 
@@ -798,20 +723,38 @@ final class SystemServerHookInstaller {
     }
 
     /**
-     * 日志线程执行：
-     *
-     * 1. 写入 LSPosed 原生日志。
-     * 2. 追加写入外部日志文件。
+     * 日志线程执行。
      */
     private void writeLog(
             int priority,
             String message,
-            Throwable throwable
+            Throwable throwable,
+            long eventTimeNs,
+            long enqueueTimeNs
     ) {
+
+        final long writeStartNs = System.nanoTime();
+
+        long queueDelayMs =
+                Math.max(
+                        0L,
+                        (writeStartNs - enqueueTimeNs) / NS_PER_MS
+                );
+
+        long eventAgeMs =
+                Math.max(
+                        0L,
+                        (writeStartNs - eventTimeNs) / NS_PER_MS
+                );
+
+        String timedMessage =
+                (message == null ? "null" : message)
+                        + " eventAgeMs=" + eventAgeMs
+                        + " queueDelayMs=" + queueDelayMs;
 
         module.safeLog(
                 priority,
-                message,
+                timedMessage,
                 throwable
         );
 
@@ -830,9 +773,7 @@ final class SystemServerHookInstaller {
             fileLogWriter.write(priorityName(priority));
             fileLogWriter.write("] ");
 
-            fileLogWriter.write(
-                    message == null ? "null" : message
-            );
+            fileLogWriter.write(timedMessage);
 
             fileLogWriter.newLine();
 
@@ -865,9 +806,6 @@ final class SystemServerHookInstaller {
         }
     }
 
-    /**
-     * 文件日志不可用时关闭 Writer。
-     */
     private void disableFileLogging(Throwable error) {
 
         fileLogDisabled = true;
@@ -924,12 +862,6 @@ final class SystemServerHookInstaller {
         }
     }
 
-    /**
-     * 弱引用对象身份快照缓存。
-     *
-     * 使用 == 比较对象身份，不调用 equals/hashCode。
-     * 每次操作都会清理已经回收的 WPC 引用。
-     */
     private static final class WeakIdentitySnapshotCache {
 
         private final ArrayList<SnapshotEntry> entries =
@@ -1015,7 +947,6 @@ final class SystemServerHookInstaller {
         ) {
 
             this.reference = new WeakReference<>(key);
-
             this.snapshot = snapshot;
         }
     }
