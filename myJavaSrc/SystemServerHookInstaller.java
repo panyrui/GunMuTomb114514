@@ -1,4 +1,3 @@
-
 package com.gunmubei.lsposed;
 
 import android.util.Log;
@@ -15,8 +14,11 @@ import java.io.StringWriter;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.Collections;
 import java.util.Date;
 import java.util.Locale;
+import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -43,7 +45,10 @@ final class SystemServerHookInstaller {
             "com.android.server.am.ProcessStatsService";
 
     private static final File LOG_FILE =
-            new File("/data/media/0/Android/墓碑日志.log");
+            new File("/storage/emulated/0/Android/滚木碑.log");
+
+    private static final int UNKNOWN =
+            Integer.MIN_VALUE;
 
     private final ModuleEntry module;
 
@@ -52,15 +57,13 @@ final class SystemServerHookInstaller {
     /*
      * 日志单线程执行器。
      *
-     * Hook 回调只采集少量数据并提交日志，
-     * 不在 system_server 原始调用线程中做 I/O。
-     *
-     * 队列有上限，避免异常情况下日志堆积。
+     * Hook 回调只采集数据并提交日志，
+     * 不在 system_server 原始调用线程中执行文件 I/O。
      */
     private final ThreadPoolExecutor logExecutor;
 
     /*
-     * 以下文件日志状态只允许日志执行器线程访问。
+     * 文件日志状态只允许日志执行器线程访问。
      */
     private BufferedWriter fileLogWriter;
 
@@ -75,6 +78,17 @@ final class SystemServerHookInstaller {
             );
 
     private int installedCount;
+
+    /*
+     * WPC 快照去重缓存。
+     *
+     * 使用 WeakHashMap，避免缓存长期强引用 WPC。
+     * 同步 Map，保证不同 Hook 回调访问时的线程安全。
+     */
+    private final Map<Object, String> lastWpcSnapshots =
+            Collections.synchronizedMap(
+                    new WeakHashMap<>()
+            );
 
     SystemServerHookInstaller(
             ModuleEntry module,
@@ -152,37 +166,19 @@ final class SystemServerHookInstaller {
                 )
         );
 
-        // ATS：可见性事务结束。
+        /*
+         * ATS：可见性事务结束。
+         *
+         * 保留原 Hook 点位。
+         * 不再记录全系统 depth=0 事件，
+         * 避免无关应用产生大量日志。
+         */
         hookAfter(
                 ATS,
                 "endActivityVisibilityUpdate",
                 new String[0],
                 chain -> {
-
-                    Object supervisor =
-                            chain.getThisObject();
-
-                    int depth =
-                            SafeReflection.readInt(
-                                    supervisor,
-                                    "mVisibilityTransactionDepth",
-                                    Integer.MIN_VALUE
-                            );
-
-                    if (depth == 0) {
-
-                        postLog(
-                                Log.INFO,
-                                "VISIBILITY_TX_COMMIT depth=0"
-                        );
-
-                    } else if (depth == Integer.MIN_VALUE) {
-
-                        postLog(
-                                Log.WARN,
-                                "VISIBILITY_TX_END depth=unknown"
-                        );
-                    }
+                    // 仅观察 Hook 是否正常触发，不输出全局事务日志。
                 }
         );
 
@@ -228,12 +224,14 @@ final class SystemServerHookInstaller {
         // ProcessStateRecord：当前进程状态变化。
         hookProcessStateSetter(
                 "setCurProcState",
+                "mCurProcState",
                 "PROCESS_STATE_CUR"
         );
 
         // ProcessStateRecord：已提交进程状态变化。
         hookProcessStateSetter(
                 "setSetProcState",
+                "mSetProcState",
                 "PROCESS_STATE_SET"
         );
 
@@ -249,49 +247,90 @@ final class SystemServerHookInstaller {
 
     /**
      * Hook ProcessStateRecord 的状态设置方法。
+     *
+     * 原方法执行前读取旧状态，
+     * 原方法执行后读取新状态。
+     *
+     * 只有字段真实发生变化才输出日志。
      */
     private void hookProcessStateSetter(
             String methodName,
+            String fieldName,
             String eventName
     ) {
 
-        hookAfter(
+        hookMethod(
                 PROCESS_STATE,
                 methodName,
                 new String[]{"int"},
-                chain -> {
+                method -> {
 
-                    Object processState =
-                            chain.getThisObject();
+                    module.hook(method).intercept(chain -> {
 
-                    Object processRecord =
-                            SafeReflection.readField(
+                        Object processState =
+                                chain.getThisObject();
+
+                        Object processRecord =
+                                SafeReflection.readField(
+                                        processState,
+                                        "mApp"
+                                );
+
+                        boolean target =
+                                ProcessSnapshot.isTargetProcessRecord(
+                                        processRecord
+                                );
+
+                        int before = UNKNOWN;
+
+                        if (target) {
+
+                            before = SafeReflection.readInt(
                                     processState,
-                                    "mApp"
+                                    fieldName,
+                                    UNKNOWN
                             );
+                        }
 
-                    if (!ProcessSnapshot.isTargetProcessRecord(
-                            processRecord
-                    )) {
-                        return;
-                    }
+                        /*
+                         * 必须先执行原方法。
+                         *
+                         * 原方法抛出异常时直接向外传播，
+                         * 不改变原方法异常行为。
+                         */
+                        Object result = chain.proceed();
 
-                    Object value = chain.getArg(0);
+                        if (!target) {
+                            return result;
+                        }
 
-                    String state =
-                            value instanceof Number
-                                    ? Integer.toString(
-                                            ((Number) value).intValue()
+                        int after = SafeReflection.readInt(
+                                processState,
+                                fieldName,
+                                UNKNOWN
+                        );
+
+                        /*
+                         * 读取失败时不猜测状态。
+                         * 只有前后都成功读取且数值不同才记录。
+                         */
+                        if (before != UNKNOWN
+                                && after != UNKNOWN
+                                && before != after) {
+
+                            postLog(
+                                    Log.INFO,
+                                    ProcessSnapshot.describeProcessRecord(
+                                            eventName
+                                                    + " old=" + before
+                                                    + " new=" + after,
+                                            processRecord
                                     )
-                                    : "unknown";
+                            );
+                        }
 
-                    postLog(
-                            Log.INFO,
-                            ProcessSnapshot.describeProcessRecord(
-                                    eventName + " value=" + state,
-                                    processRecord
-                            )
-                    );
+                        return result;
+                    });
                 }
         );
     }
@@ -336,6 +375,7 @@ final class SystemServerHookInstaller {
                             Object result = chain.proceed();
 
                             if (before != null) {
+
                                 postLog(
                                         Log.INFO,
                                         before
@@ -349,6 +389,7 @@ final class SystemServerHookInstaller {
                         } catch (Throwable originalError) {
 
                             if (before != null) {
+
                                 postLog(
                                         Log.ERROR,
                                         before + " cleanupThrew",
@@ -356,7 +397,7 @@ final class SystemServerHookInstaller {
                                 );
                             }
 
-                            // 原方法异常原样抛出，不能吞掉。
+                            // 原方法异常原样抛出。
                             throw originalError;
                         }
                     });
@@ -367,7 +408,7 @@ final class SystemServerHookInstaller {
     /**
      * 安装 after 型 Hook。
      *
-     * 必须先执行原方法。
+     * 先执行原方法。
      * 观察代码出错时只记录异常，不影响原方法结果。
      */
     private void hookAfter(
@@ -388,7 +429,9 @@ final class SystemServerHookInstaller {
                         Object result = chain.proceed();
 
                         try {
+
                             action.run(chain);
+
                         } catch (Throwable observerError) {
 
                             postLog(
@@ -436,6 +479,7 @@ final class SystemServerHookInstaller {
                     "Hook class unavailable: " + className,
                     error
             );
+
             return;
 
         } catch (Throwable error) {
@@ -445,6 +489,7 @@ final class SystemServerHookInstaller {
                     "Unexpected error loading class: " + className,
                     error
             );
+
             return;
         }
 
@@ -472,6 +517,7 @@ final class SystemServerHookInstaller {
                     if (!actual[i].getName().equals(
                             parameterTypeNames[i]
                     )) {
+
                         matches = false;
                         break;
                     }
@@ -491,6 +537,7 @@ final class SystemServerHookInstaller {
                             + className + "." + methodName,
                     error
             );
+
             return;
         }
 
@@ -501,6 +548,7 @@ final class SystemServerHookInstaller {
                     "Exact method not found: "
                             + className + "." + methodName
             );
+
             return;
         }
 
@@ -528,6 +576,11 @@ final class SystemServerHookInstaller {
 
     /**
      * 记录 WPC 事件。
+     *
+     * Tracker 事件是可见性边沿，始终记录。
+     *
+     * WPC_COMPUTE 是高频计算事件，
+     * 只有快照发生变化才记录。
      */
     private void logWpcEvent(
             String event,
@@ -538,9 +591,48 @@ final class SystemServerHookInstaller {
             return;
         }
 
+        String snapshot =
+                ProcessSnapshot.describeWpc(
+                        "WPC_STATE",
+                        wpc
+                );
+
+        if ("WPC_COMPUTE".equals(event)) {
+
+            String previous;
+
+            synchronized (lastWpcSnapshots) {
+
+                previous = lastWpcSnapshots.get(wpc);
+
+                if (snapshot.equals(previous)) {
+                    return;
+                }
+
+                lastWpcSnapshots.put(
+                        wpc,
+                        snapshot
+                );
+            }
+
+            postLog(
+                    Log.INFO,
+                    snapshot.replaceFirst(
+                            "^WPC_STATE",
+                            "WPC_COMPUTE"
+                    )
+            );
+
+            return;
+        }
+
+        // Tracker 边沿事件不参与去重。
         postLog(
                 Log.INFO,
-                ProcessSnapshot.describeWpc(event, wpc)
+                ProcessSnapshot.describeWpc(
+                        event,
+                        wpc
+                )
         );
     }
 
@@ -551,6 +643,7 @@ final class SystemServerHookInstaller {
             int priority,
             String message
     ) {
+
         postLog(priority, message, null);
     }
 
@@ -571,12 +664,14 @@ final class SystemServerHookInstaller {
             );
 
         } catch (RuntimeException ignored) {
+
             // 日志提交失败不能影响 system_server。
         }
     }
 
     /**
      * 日志线程执行：
+     *
      * 1. 写入 LSPosed 原生日志。
      * 2. 追加写入外部日志文件。
      */
@@ -587,7 +682,11 @@ final class SystemServerHookInstaller {
     ) {
 
         // 保留 LSPosed 原生日志。
-        module.safeLog(priority, message, throwable);
+        module.safeLog(
+                priority,
+                message,
+                throwable
+        );
 
         if (fileLogDisabled) {
             return;
@@ -603,12 +702,15 @@ final class SystemServerHookInstaller {
             fileLogWriter.write(
                     logTimeFormat.format(new Date())
             );
+
             fileLogWriter.write("] [");
             fileLogWriter.write(priorityName(priority));
             fileLogWriter.write("] ");
+
             fileLogWriter.write(
                     message == null ? "null" : message
             );
+
             fileLogWriter.newLine();
 
             if (throwable != null) {
@@ -632,7 +734,6 @@ final class SystemServerHookInstaller {
                 }
             }
 
-            // 及时刷新，降低异常退出造成的日志丢失。
             fileLogWriter.flush();
 
         } catch (Throwable error) {
@@ -649,6 +750,7 @@ final class SystemServerHookInstaller {
         File parent = LOG_FILE.getParentFile();
 
         if (parent == null) {
+
             throw new IOException(
                     "Log parent directory is null"
             );
@@ -657,6 +759,7 @@ final class SystemServerHookInstaller {
         if (!parent.exists()) {
 
             if (!parent.mkdirs() && !parent.isDirectory()) {
+
                 throw new IOException(
                         "Cannot create log directory: "
                                 + parent.getAbsolutePath()
@@ -665,6 +768,7 @@ final class SystemServerHookInstaller {
         }
 
         if (!parent.isDirectory()) {
+
             throw new IOException(
                     "Log parent is not a directory: "
                             + parent.getAbsolutePath()
@@ -692,7 +796,9 @@ final class SystemServerHookInstaller {
         if (fileLogWriter != null) {
 
             try {
+
                 fileLogWriter.close();
+
             } catch (Throwable ignored) {
             }
 
@@ -740,11 +846,13 @@ final class SystemServerHookInstaller {
     }
 
     private interface AfterAction {
+
         void run(XposedInterface.Chain chain)
                 throws Throwable;
     }
 
     private interface MethodInstaller {
+
         void install(Method method)
                 throws Throwable;
     }
