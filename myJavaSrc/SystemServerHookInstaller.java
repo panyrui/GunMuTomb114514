@@ -1,11 +1,22 @@
+
 package com.gunmubei.lsposed;
 
 import android.util.Log;
 
 import io.github.libxposed.api.XposedInterface;
 
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.reflect.Method;
-
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -31,6 +42,9 @@ final class SystemServerHookInstaller {
     private static final String PROCESS_STATS =
             "com.android.server.am.ProcessStatsService";
 
+    private static final File LOG_FILE =
+            new File("/data/media/0/Android/墓碑日志.log");
+
     private final ModuleEntry module;
 
     private final ClassLoader classLoader;
@@ -44,6 +58,21 @@ final class SystemServerHookInstaller {
      * 队列有上限，避免异常情况下日志堆积。
      */
     private final ThreadPoolExecutor logExecutor;
+
+    /*
+     * 以下文件日志状态只允许日志执行器线程访问。
+     */
+    private BufferedWriter fileLogWriter;
+
+    private boolean fileLogDisabled;
+
+    private boolean fileLogErrorReported;
+
+    private final SimpleDateFormat logTimeFormat =
+            new SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm:ss.SSS",
+                    Locale.US
+            );
 
     private int installedCount;
 
@@ -534,7 +563,7 @@ final class SystemServerHookInstaller {
         try {
 
             logExecutor.execute(
-                    () -> module.safeLog(
+                    () -> writeLog(
                             priority,
                             message,
                             throwable
@@ -543,6 +572,170 @@ final class SystemServerHookInstaller {
 
         } catch (RuntimeException ignored) {
             // 日志提交失败不能影响 system_server。
+        }
+    }
+
+    /**
+     * 日志线程执行：
+     * 1. 写入 LSPosed 原生日志。
+     * 2. 追加写入外部日志文件。
+     */
+    private void writeLog(
+            int priority,
+            String message,
+            Throwable throwable
+    ) {
+
+        // 保留 LSPosed 原生日志。
+        module.safeLog(priority, message, throwable);
+
+        if (fileLogDisabled) {
+            return;
+        }
+
+        try {
+
+            if (fileLogWriter == null) {
+                openLogFile();
+            }
+
+            fileLogWriter.write("[");
+            fileLogWriter.write(
+                    logTimeFormat.format(new Date())
+            );
+            fileLogWriter.write("] [");
+            fileLogWriter.write(priorityName(priority));
+            fileLogWriter.write("] ");
+            fileLogWriter.write(
+                    message == null ? "null" : message
+            );
+            fileLogWriter.newLine();
+
+            if (throwable != null) {
+
+                StringWriter stringWriter =
+                        new StringWriter();
+
+                PrintWriter printWriter =
+                        new PrintWriter(stringWriter);
+
+                throwable.printStackTrace(printWriter);
+                printWriter.flush();
+
+                String stackTrace =
+                        stringWriter.toString();
+
+                fileLogWriter.write(stackTrace);
+
+                if (!stackTrace.endsWith("\n")) {
+                    fileLogWriter.newLine();
+                }
+            }
+
+            // 及时刷新，降低异常退出造成的日志丢失。
+            fileLogWriter.flush();
+
+        } catch (Throwable error) {
+
+            disableFileLogging(error);
+        }
+    }
+
+    /**
+     * 创建日志目录并以追加模式打开日志文件。
+     */
+    private void openLogFile() throws IOException {
+
+        File parent = LOG_FILE.getParentFile();
+
+        if (parent == null) {
+            throw new IOException(
+                    "Log parent directory is null"
+            );
+        }
+
+        if (!parent.exists()) {
+
+            if (!parent.mkdirs() && !parent.isDirectory()) {
+                throw new IOException(
+                        "Cannot create log directory: "
+                                + parent.getAbsolutePath()
+                );
+            }
+        }
+
+        if (!parent.isDirectory()) {
+            throw new IOException(
+                    "Log parent is not a directory: "
+                            + parent.getAbsolutePath()
+            );
+        }
+
+        fileLogWriter = new BufferedWriter(
+                new OutputStreamWriter(
+                        new FileOutputStream(LOG_FILE, true),
+                        StandardCharsets.UTF_8
+                )
+        );
+    }
+
+    /**
+     * 文件日志不可用时关闭 Writer。
+     *
+     * 只向 LSPosed 原生日志报告一次，
+     * 防止文件权限错误造成无限日志递归。
+     */
+    private void disableFileLogging(Throwable error) {
+
+        fileLogDisabled = true;
+
+        if (fileLogWriter != null) {
+
+            try {
+                fileLogWriter.close();
+            } catch (Throwable ignored) {
+            }
+
+            fileLogWriter = null;
+        }
+
+        if (!fileLogErrorReported) {
+
+            fileLogErrorReported = true;
+
+            module.safeLog(
+                    Log.ERROR,
+                    "File logging disabled: "
+                            + LOG_FILE.getAbsolutePath(),
+                    error
+            );
+        }
+    }
+
+    private static String priorityName(int priority) {
+
+        switch (priority) {
+
+            case Log.VERBOSE:
+                return "V";
+
+            case Log.DEBUG:
+                return "D";
+
+            case Log.INFO:
+                return "I";
+
+            case Log.WARN:
+                return "W";
+
+            case Log.ERROR:
+                return "E";
+
+            case Log.ASSERT:
+                return "A";
+
+            default:
+                return Integer.toString(priority);
         }
     }
 
