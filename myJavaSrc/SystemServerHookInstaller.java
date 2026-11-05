@@ -1,3 +1,4 @@
+
 package com.gunmubei.lsposed;
 
 import android.util.Log;
@@ -10,6 +11,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 final class SystemServerHookInstaller {
 
@@ -22,17 +24,22 @@ final class SystemServerHookInstaller {
     private final ModuleEntry module;
     private final ClassLoader classLoader;
 
-    /*
-     * 日志只在独立线程输出。
-     * Hook 回调内不执行文件 I/O。
-     */
     private final ThreadPoolExecutor logExecutor;
 
-    /*
-     * 只有一个日志线程访问此格式化器。
-     */
     private final SimpleDateFormat timeFormat =
-            new SimpleDateFormat("HH:mm:ss", Locale.US);
+            new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
+
+    /*
+     * 诊断日志只输出一次，避免高频调用刷屏。
+     */
+    private final AtomicBoolean callbackLogged =
+            new AtomicBoolean(false);
+
+    private final AtomicBoolean targetLogged =
+            new AtomicBoolean(false);
+
+    private final AtomicBoolean callbackErrorLogged =
+            new AtomicBoolean(false);
 
     SystemServerHookInstaller(
             ModuleEntry module,
@@ -79,27 +86,18 @@ final class SystemServerHookInstaller {
     }
 
     /**
-     * 观察 ProcessStateRecord.setHasForegroundActivities(boolean)。
+     * Hook ProcessStateRecord.setHasForegroundActivities(boolean)。
      *
-     * 设备 Smali 已确认：
-     *
-     * .method setHasForegroundActivities(Z)V
-     *
-     * 方法内部直接更新：
-     *
-     * mHasForegroundActivities
-     *
-     * OomAdjuster 的调用顺序是：
-     *
-     * setHasForegroundActivities(...)
-     * setCurrentSchedulingGroup(...)
-     *
-     * 因此这里可以在调度组更新之前获知 AMS 计算出的前台 Activity 状态。
+     * 观察 AMS 对进程前台 Activity 状态的更新。
+     * 不修改参数、不改变原方法行为。
      */
     private void hookForegroundActivityState() {
 
         final Method targetMethod;
 
+        /*
+         * 第一阶段：定位目标方法。
+         */
         try {
 
             Class<?> ownerClass = Class.forName(
@@ -114,11 +112,9 @@ final class SystemServerHookInstaller {
 
                 module.safeLog(
                         Log.ERROR,
-                        "Hook method not found: "
-                                + PROCESS_STATE
-                                + "."
-                                + METHOD_NAME
-                                + "(boolean)",
+                        "HOOK_FAILED reason=METHOD_NOT_FOUND"
+                                + " class=" + PROCESS_STATE
+                                + " method=" + METHOD_NAME,
                         null
                 );
 
@@ -129,114 +125,168 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.ERROR,
-                    "Cannot locate foreground state method",
+                    "HOOK_FAILED stage=FIND_METHOD",
                     error
             );
 
             return;
         }
 
+        /*
+         * 第二阶段：注册 Hook。
+         */
         try {
 
             module.hook(targetMethod).intercept(chain -> {
 
                 String logMessage = null;
-                long eventTime = 0L;
+                long eventTime = System.currentTimeMillis();
 
-                /*
-                 * 只观察目标应用。
-                 * 任何观察异常都不能影响原方法。
-                 */
                 try {
+
+                    /*
+                     * 首次回调确认。
+                     *
+                     * 不检查包名、PID 或状态，
+                     * 只要目标方法进入就记录。
+                     */
+                    if (callbackLogged.compareAndSet(
+                            false,
+                            true
+                    )) {
+
+                        postLog(
+                                eventTime,
+                                "HOOK_CALLBACK"
+                                        + " method=" + METHOD_NAME
+                                        + " receiver="
+                                        + chain.getThisObject()
+                                                .getClass()
+                                                .getName()
+                        );
+                    }
 
                     Object processState =
                             chain.getThisObject();
 
+                    /*
+                     * ProcessStateRecord.mApp
+                     * 对应 ProcessRecord。
+                     */
                     Object processRecord =
                             SafeReflection.readField(
                                     processState,
                                     "mApp"
                             );
 
+                    /*
+                     * 只观察目标应用。
+                     */
                     if (ProcessSnapshot.isTargetProcessRecord(
                             processRecord
                     )) {
 
                         Object arg = chain.getArg(0);
 
-                        if (arg instanceof Boolean) {
+                        boolean nextState =
+                                arg instanceof Boolean
+                                        && (Boolean) arg;
 
-                            boolean nextState =
-                                    (Boolean) arg;
+                        Object oldValue =
+                                SafeReflection.readField(
+                                        processState,
+                                        "mHasForegroundActivities"
+                                );
 
-                            Object oldValue =
-                                    SafeReflection.readField(
-                                            processState,
-                                            "mHasForegroundActivities"
-                                    );
+                        int pid =
+                                SafeReflection.readInt(
+                                        processRecord,
+                                        "mPid",
+                                        -1
+                                );
 
-                            int pid =
-                                    SafeReflection.readInt(
-                                            processRecord,
-                                            "mPid",
-                                            -1
-                                    );
+                        String packageName =
+                                readPackageName(processRecord);
 
-                            /*
-                             * 只在状态确实变化时输出。
-                             * PID 尚未建立时不输出。
-                             */
-                            if (oldValue instanceof Boolean
-                                    && pid > 0) {
+                        /*
+                         * 首次识别目标进程时输出一次。
+                         *
+                         * 即使 PID 或旧状态读取失败，
+                         * 也能看到目标进程是否被识别。
+                         */
+                        if (targetLogged.compareAndSet(
+                                false,
+                                true
+                        )) {
 
-                                boolean oldState =
-                                        (Boolean) oldValue;
+                            postLog(
+                                    eventTime,
+                                    "HOOK_TARGET"
+                                            + " package=" + packageName
+                                            + " pid=" + pid
+                                            + " oldState=" + oldValue
+                                            + " newState=" + arg
+                            );
+                        }
 
-                                if (oldState != nextState) {
+                        /*
+                         * 只有旧状态确实是 Boolean，
+                         * 且新旧状态不同，才输出状态变化。
+                         *
+                         * 不再要求 pid > 0。
+                         */
+                        if (oldValue instanceof Boolean
+                                && arg instanceof Boolean) {
 
-                                    String packageName =
-                                            readPackageName(
-                                                    processRecord
-                                            );
+                            boolean oldState =
+                                    (Boolean) oldValue;
 
-                                    String event =
-                                            nextState
-                                                    ? "[前台] "
-                                                    : "[后台] ";
+                            if (oldState != nextState) {
 
-                                    logMessage =
-                                            event
-                                                    + packageName
-                                                    + " (pid "
-                                                    + pid
-                                                    + ")";
+                                String event =
+                                        nextState
+                                                ? "[前台] "
+                                                : "[后台] ";
 
-                                    /*
-                                     * 时间戳在 Hook 回调中取得，
-                                     * 不使用日志线程执行时的时间。
-                                     */
-                                    eventTime =
-                                            System.currentTimeMillis();
-                                }
+                                logMessage =
+                                        event
+                                                + packageName
+                                                + " (pid "
+                                                + pid
+                                                + ")";
+
+                                eventTime =
+                                        System.currentTimeMillis();
                             }
                         }
                     }
 
-                } catch (Throwable ignored) {
+                } catch (Throwable error) {
+
                     /*
-                     * 观察逻辑异常不能干扰 system_server。
+                     * 观察逻辑异常只报告一次。
+                     * 不允许影响原方法执行。
                      */
+                    if (callbackErrorLogged.compareAndSet(
+                            false,
+                            true
+                    )) {
+
+                        module.safeLog(
+                                Log.ERROR,
+                                "HOOK_ERROR stage=CALLBACK",
+                                error
+                        );
+                    }
                 }
 
                 /*
                  * 原方法正常执行。
-                 * 不修改参数，不改变系统状态。
                  */
                 Object result = chain.proceed();
 
                 /*
-                 * 原方法完成后立即提交日志。
-                 * 时间戳仍然是进入 Hook 时记录的时间。
+                 * 原方法执行完成后提交状态变化日志。
                  */
                 if (logMessage != null) {
 
@@ -249,11 +299,25 @@ final class SystemServerHookInstaller {
                 return result;
             });
 
+            /*
+             * 只有 intercept 正常返回后，
+             * 才报告 Hook 注册成功。
+             */
+            module.safeLog(
+                    Log.INFO,
+                    "HOOK_OK"
+                            + " class=" + PROCESS_STATE
+                            + " method=" + METHOD_NAME
+                            + "(boolean)",
+                    null
+            );
+
         } catch (Throwable error) {
 
             module.safeLog(
                     Log.ERROR,
-                    "Cannot install foreground state hook",
+                    "HOOK_FAILED stage=REGISTER"
+                            + " method=" + METHOD_NAME,
                     error
             );
         }
@@ -318,7 +382,7 @@ final class SystemServerHookInstaller {
     }
 
     /**
-     * 异步提交状态变化日志。
+     * 异步提交日志。
      */
     private void postLog(
             long eventTime,
@@ -347,9 +411,6 @@ final class SystemServerHookInstaller {
             });
 
         } catch (RuntimeException ignored) {
-            /*
-             * 队列提交失败不影响 system_server。
-             */
         }
     }
 }
