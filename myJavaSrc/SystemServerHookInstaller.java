@@ -1,11 +1,12 @@
+
 package com.gunmubei.lsposed;
 
 import android.util.Log;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadFactory;
@@ -15,27 +16,35 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 final class SystemServerHookInstaller {
 
+    private static final String TAG_CLASS =
+            "com.android.server.wm.ActivityTaskManagerService";
+
     private static final String ACTIVITY_RECORD_CLASS =
             "com.android.server.wm.ActivityRecord";
 
-    private static final String SET_VISIBLE_METHOD = "setVisible";
-    private static final String SET_VISIBLE_REQUESTED_METHOD =
-            "setVisibleRequested";
+    private static final String METHOD_NAME =
+            "updateTopApp";
+
+    private static final String TOP_APP_FIELD =
+            "mTopApp";
+
+    private static final Object READ_FAILED = new Object();
 
     private final ModuleEntry module;
     private final ClassLoader classLoader;
+
     private final ThreadPoolExecutor logExecutor;
 
     private final SimpleDateFormat timeFormat =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
-    private final AtomicBoolean setVisibleCallbackLogged =
-            new AtomicBoolean(false);
-
-    private final AtomicBoolean setVisibleRequestedCallbackLogged =
+    private final AtomicBoolean callbackLogged =
             new AtomicBoolean(false);
 
     private final AtomicBoolean callbackErrorLogged =
+            new AtomicBoolean(false);
+
+    private final AtomicBoolean fieldErrorLogged =
             new AtomicBoolean(false);
 
     SystemServerHookInstaller(
@@ -50,13 +59,13 @@ final class SystemServerHookInstaller {
                 1,
                 0L,
                 TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(256),
+                new ArrayBlockingQueue<>(128),
                 new ThreadFactory() {
                     @Override
                     public Thread newThread(Runnable runnable) {
                         Thread thread = new Thread(
                                 runnable,
-                                "GunMuBei-ObserverLog"
+                                "GunMuBei-TopAppLog"
                         );
                         thread.setDaemon(true);
                         return thread;
@@ -67,48 +76,54 @@ final class SystemServerHookInstaller {
     }
 
     void install() {
-        hookVisibilitySetter(SET_VISIBLE_METHOD, false);
-        hookVisibilitySetter(SET_VISIBLE_REQUESTED_METHOD, true);
+        hookTopAppUpdate();
     }
 
     /**
-     * 在 ActivityRecord 的单个可见性字段即将改变时观察进程级状态。
+     * Hook:
+     * ActivityTaskManagerService.updateTopApp(ActivityRecord)
      *
-     * mVisible 与 mVisibleRequested 都参与 Android 13 WPC 的可见状态
-     * 汇总，因此两个 setter 是同一主观察点的两个必要入口，不是慢 Hook
-     * 的辅助或回退方案。
+     * 在原方法执行前读取旧 mTopApp，
+     * 原方法执行后读取新 mTopApp。
      *
-     * 回调发生在字段写入和后续 onProcessActivityStateChanged 之前。
-     * 本 Hook 只读取状态并记录，不改写系统参数或返回值。
+     * 不修改系统参数，不修改系统返回值。
      */
-    private void hookVisibilitySetter(
-            String methodName,
-            boolean requestedField
-    ) {
+    private void hookTopAppUpdate() {
+
         final Method targetMethod;
 
         try {
-            Class<?> ownerClass = Class.forName(
+            Class<?> serviceClass = Class.forName(
+                    TAG_CLASS,
+                    false,
+                    classLoader
+            );
+
+            Class<?> activityRecordClass = Class.forName(
                     ACTIVITY_RECORD_CLASS,
                     false,
                     classLoader
             );
 
-            targetMethod = findBooleanSetter(ownerClass, methodName);
-            if (targetMethod == null) {
+            targetMethod = serviceClass.getDeclaredMethod(
+                    METHOD_NAME,
+                    activityRecordClass
+            );
+
+            if (targetMethod.getReturnType() != void.class) {
                 module.safeLog(
                         Log.ERROR,
-                        "HOOK_FAILED reason=METHOD_NOT_FOUND"
-                                + " class=" + ACTIVITY_RECORD_CLASS
-                                + " method=" + methodName + "(boolean)",
+                        "HOOK_FAILED reason=INVALID_RETURN_TYPE",
                         null
                 );
                 return;
             }
+
         } catch (Throwable error) {
             module.safeLog(
                     Log.ERROR,
-                    "HOOK_FAILED stage=FIND_METHOD method=" + methodName,
+                    "HOOK_FAILED stage=FIND_METHOD"
+                            + " method=" + METHOD_NAME,
                     error
             );
             return;
@@ -116,210 +131,308 @@ final class SystemServerHookInstaller {
 
         try {
             module.hook(targetMethod).intercept(chain -> {
+
+                Object service = chain.getThisObject();
+
+                /*
+                 * 必须在原方法执行前读取旧值。
+                 * null 是合法状态，READ_FAILED 才表示读取失败。
+                 */
+                Object oldTopApp = readFieldStrict(
+                        service,
+                        TOP_APP_FIELD
+                );
+
+                /*
+                 * 原方法必须正常执行。
+                 * 如果原方法抛出异常，保持原有异常行为。
+                 */
+                Object result = chain.proceed();
+
                 try {
-                    Object activityRecord = chain.getThisObject();
-                    Object arg = chain.getArg(0);
+                    Object newTopApp = readFieldStrict(
+                            service,
+                            TOP_APP_FIELD
+                    );
 
-                    if (arg instanceof Boolean) {
-                        boolean requestedValue = (Boolean) arg;
-                        String event = inspectVisibilityTransition(
-                                activityRecord,
-                                requestedField,
-                                requestedValue,
-                                methodName
-                        );
+                    handleTopAppChange(
+                            oldTopApp,
+                            newTopApp
+                    );
 
-                        if (event != null) {
-                            /*
-                             * 先入日志队列，再进入原 setter。
-                             * 时间戳取自 Hook 入口，避免把后续 WPC 汇总耗时
-                             * 混入事件发生时间。
-                             */
-                            postLog(System.currentTimeMillis(), event);
-                        }
-                    }
+                    logFirstCallback();
 
-                    logFirstCallback(methodName, requestedField);
                 } catch (Throwable error) {
                     reportCallbackError(error);
                 }
 
-                return chain.proceed();
+                return result;
             });
 
             module.safeLog(
                     Log.INFO,
-                    "HOOK_OK class=" + ACTIVITY_RECORD_CLASS
-                            + " method=" + methodName
-                            + "(boolean) mode=PRE_FIELD_UPDATE",
+                    "HOOK_OK class=" + TAG_CLASS
+                            + " method=" + METHOD_NAME
+                            + "(ActivityRecord)"
+                            + " mode=BEFORE_AFTER",
                     null
             );
+
         } catch (Throwable error) {
             module.safeLog(
                     Log.ERROR,
-                    "HOOK_FAILED stage=REGISTER method=" + methodName,
+                    "HOOK_FAILED stage=REGISTER"
+                            + " method=" + METHOD_NAME,
                     error
             );
         }
     }
 
     /**
-     * 用当前 ActivityRecord 的新字段值，计算同一 WPC 下所有 Activity
-     * 的旧/新聚合可见性。判断口径与 Android 13 WPC 的 0x110000
-     * 可见掩码一致：任一 Activity 的 mVisible 或 mVisibleRequested 为
-     * true，进程就仍视为有可见 Activity。
+     * 根据 mTopApp 的前后变化判断目标应用状态。
      */
-    private static String inspectVisibilityTransition(
-            Object changedActivity,
-            boolean requestedField,
-            boolean newValue,
-            String trigger
+    private void handleTopAppChange(
+            Object oldTopApp,
+            Object newTopApp
     ) {
-        if (changedActivity == null) {
-            return null;
+
+        if (oldTopApp == READ_FAILED
+                || newTopApp == READ_FAILED) {
+
+            reportFieldError();
+            return;
         }
 
-        Object wpc = SafeReflection.readField(changedActivity, "app");
-        if (!ProcessSnapshot.isTargetWpc(wpc)) {
-            return null;
-        }
+        boolean oldTarget =
+                ProcessSnapshot.isTargetWpc(oldTopApp);
 
-        Object activitiesObject =
-                SafeReflection.readField(wpc, "mActivities");
-
-        if (!(activitiesObject instanceof List<?>)) {
-            return null;
-        }
-
-        List<?> activities = (List<?>) activitiesObject;
-        boolean oldAnyVisible = false;
-        boolean newAnyVisible = false;
-        boolean changedRecordFound = false;
-
-        for (Object activity : activities) {
-            if (activity == null) {
-                continue;
-            }
-
-            boolean oldVisible = readBooleanField(activity, "mVisible");
-            boolean oldRequested = readBooleanField(activity, "mVisibleRequested");
-
-            boolean newVisible = oldVisible;
-            boolean newRequested = oldRequested;
-
-            if (activity == changedActivity) {
-                changedRecordFound = true;
-                if (requestedField) {
-                    newRequested = newValue;
-                } else {
-                    newVisible = newValue;
-                }
-            }
-
-            oldAnyVisible |= oldVisible || oldRequested;
-            newAnyVisible |= newVisible || newRequested;
-        }
+        boolean newTarget =
+                ProcessSnapshot.isTargetWpc(newTopApp);
 
         /*
-         * 兼容刚挂接到 WPC、但尚未进入 mActivities 的短暂窗口。
-         * 如果当前记录不在列表中，只把当前记录计入聚合值。
+         * 目标应用状态没有变化，不产生重复事件。
          */
-        if (!changedRecordFound) {
-            boolean oldVisible = readBooleanField(changedActivity, "mVisible");
-            boolean oldRequested = readBooleanField(changedActivity, "mVisibleRequested");
-            boolean newVisible = requestedField ? oldVisible : newValue;
-            boolean newRequested = requestedField ? newValue : oldRequested;
-
-            oldAnyVisible |= oldVisible || oldRequested;
-            newAnyVisible |= newVisible || newRequested;
+        if (oldTarget == newTarget) {
+            return;
         }
 
-        if (oldAnyVisible == newAnyVisible) {
-            return null;
+        Object targetWpc = newTarget
+                ? newTopApp
+                : oldTopApp;
+
+        String status = newTarget
+                ? "[前台]"
+                : "[后台]";
+
+        StringBuilder message = new StringBuilder(400);
+
+        message.append(
+                ProcessSnapshot.describeWpc(
+                        status,
+                        targetWpc
+                )
+        );
+
+        message.append(" source=ATMS.updateTopApp");
+
+        message.append(" oldTarget=")
+                .append(oldTarget);
+
+        message.append(" newTarget=")
+                .append(newTarget);
+
+        message.append(" topNow=")
+                .append(describeTopApp(newTopApp));
+
+        /*
+         * 时间戳在 Hook 回调内获取。
+         * 后续日志线程即使有排队，也不会改变事件时间。
+         */
+        postLog(
+                System.currentTimeMillis(),
+                message.toString()
+        );
+    }
+
+    /**
+     * 描述当前 Top App。
+     */
+    private static String describeTopApp(Object wpc) {
+
+        if (wpc == null) {
+            return "null";
         }
 
-        String status = newAnyVisible ? "[前台]" : "[后台]";
-        return ProcessSnapshot.describeWpc(status, wpc)
-                + " trigger=" + trigger
-                + " oldVisible=" + oldAnyVisible
-                + " newVisible=" + newAnyVisible
-                + " activityId=0x"
+        if (wpc == READ_FAILED) {
+            return "unavailable";
+        }
+
+        String processName =
+                SafeReflection.readString(
+                        wpc,
+                        "mName"
+                );
+
+        int uid =
+                SafeReflection.readInt(
+                        wpc,
+                        "mUid",
+                        Integer.MIN_VALUE
+                );
+
+        int pid =
+                SafeReflection.readInt(
+                        wpc,
+                        "mPid",
+                        Integer.MIN_VALUE
+                );
+
+        return "process=" + valueOrUnknown(processName)
+                + ",uid=" + formatInt(uid)
+                + ",pid=" + formatInt(pid)
+                + ",wpcId=0x"
                 + Integer.toHexString(
-                        System.identityHashCode(changedActivity)
+                        System.identityHashCode(wpc)
                 );
     }
 
-    private void logFirstCallback(
-            String methodName,
-            boolean requestedField
-    ) {
-        AtomicBoolean marker = requestedField
-                ? setVisibleRequestedCallbackLogged
-                : setVisibleCallbackLogged;
-
-        if (marker.compareAndSet(false, true)) {
-            postLog(
-                    System.currentTimeMillis(),
-                    "HOOK_CALLBACK method=" + methodName
-            );
-        }
-    }
-
-    private static Method findBooleanSetter(
-            Class<?> ownerClass,
-            String methodName
-    ) {
-        for (Method method : ownerClass.getDeclaredMethods()) {
-            if (!methodName.equals(method.getName())) {
-                continue;
-            }
-
-            Class<?>[] parameters = method.getParameterTypes();
-            if (parameters.length != 1
-                    || parameters[0] != boolean.class
-                    || method.getReturnType() != void.class) {
-                continue;
-            }
-
-            return method;
-        }
-        return null;
-    }
-
-    private static boolean readBooleanField(
+    /**
+     * 严格读取字段。
+     *
+     * 与 SafeReflection.readField 不同，
+     * 这里需要区分：
+     * 1. 字段真实值为 null。
+     * 2. 字段读取失败。
+     */
+    private static Object readFieldStrict(
             Object target,
             String fieldName
     ) {
-        Object value = SafeReflection.readField(target, fieldName);
-        return Boolean.TRUE.equals(value);
+
+        if (target == null
+                || fieldName == null
+                || fieldName.isEmpty()) {
+            return READ_FAILED;
+        }
+
+        Class<?> current = target.getClass();
+
+        while (current != null) {
+
+            try {
+                Field field =
+                        current.getDeclaredField(fieldName);
+
+                try {
+                    field.setAccessible(true);
+
+                    return field.get(target);
+
+                } catch (
+                        IllegalAccessException
+                        | RuntimeException
+                        | LinkageError error
+                ) {
+                    return READ_FAILED;
+                }
+
+            } catch (NoSuchFieldException ignored) {
+
+                current = current.getSuperclass();
+
+            } catch (
+                    RuntimeException
+                    | LinkageError error
+            ) {
+                return READ_FAILED;
+            }
+        }
+
+        return READ_FAILED;
+    }
+
+    private void logFirstCallback() {
+
+        if (!callbackLogged.compareAndSet(false, true)) {
+            return;
+        }
+
+        postLog(
+                System.currentTimeMillis(),
+                "HOOK_CALLBACK method=" + METHOD_NAME
+        );
+    }
+
+    private void reportFieldError() {
+
+        if (!fieldErrorLogged.compareAndSet(false, true)) {
+            return;
+        }
+
+        module.safeLog(
+                Log.ERROR,
+                "HOOK_ERROR stage=READ_TOP_APP_FIELD",
+                null
+        );
     }
 
     private void reportCallbackError(Throwable error) {
-        if (callbackErrorLogged.compareAndSet(false, true)) {
-            module.safeLog(
-                    Log.ERROR,
-                    "HOOK_ERROR stage=CALLBACK",
-                    error
-            );
+
+        if (!callbackErrorLogged.compareAndSet(false, true)) {
+            return;
         }
+
+        module.safeLog(
+                Log.ERROR,
+                "HOOK_ERROR stage=CALLBACK",
+                error
+        );
     }
 
-    private void postLog(long eventTime, String message) {
+    /**
+     * 异步输出日志，避免在 system_server 的调用路径中
+     * 执行日期格式化和日志输出。
+     */
+    private void postLog(
+            long eventTime,
+            String message
+    ) {
+
         try {
             logExecutor.execute(() -> {
+
                 try {
                     String timestamp =
-                            timeFormat.format(new Date(eventTime));
+                            timeFormat.format(
+                                    new Date(eventTime)
+                            );
+
                     module.safeLog(
                             Log.INFO,
                             timestamp + " " + message,
                             null
                     );
+
                 } catch (Throwable ignored) {
                 }
             });
+
         } catch (RuntimeException ignored) {
-            /* 日志队列异常不能影响 system_server。 */
+            /*
+             * 日志队列异常不能影响 system_server。
+             */
         }
+    }
+
+    private static String valueOrUnknown(String value) {
+        return value == null || value.isEmpty()
+                ? "unknown"
+                : value;
+    }
+
+    private static String formatInt(int value) {
+        return value == Integer.MIN_VALUE
+                ? "unknown"
+                : Integer.toString(value);
     }
 }
