@@ -15,23 +15,27 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 final class SystemServerHookInstaller {
 
-    private static final String PROCESS_STATE =
-            "com.android.server.am.ProcessStateRecord";
+    private static final String WPC_CLASS =
+            "com.android.server.wm.WindowProcessController";
 
     private static final String METHOD_NAME =
-            "setHasForegroundActivities";
+            "computeProcessActivityState";
+
+    /*
+     * 与 Android 13 WPC 中的可见状态判断保持一致。
+     *
+     * 0x10000：存在可见 Activity
+     * 0x100000：存在可见请求 Activity
+     */
+    private static final int VISIBLE_MASK = 0x110000;
 
     private final ModuleEntry module;
     private final ClassLoader classLoader;
-
     private final ThreadPoolExecutor logExecutor;
 
     private final SimpleDateFormat timeFormat =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
-    /*
-     * 诊断日志只输出一次，避免高频调用刷屏。
-     */
     private final AtomicBoolean callbackLogged =
             new AtomicBoolean(false);
 
@@ -45,7 +49,6 @@ final class SystemServerHookInstaller {
             ModuleEntry module,
             ClassLoader classLoader
     ) {
-
         this.module = module;
         this.classLoader = classLoader;
 
@@ -56,24 +59,13 @@ final class SystemServerHookInstaller {
                 TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(256),
                 new ThreadFactory() {
-
                     @Override
                     public Thread newThread(Runnable runnable) {
-
                         Thread thread = new Thread(
                                 runnable,
                                 "GunMuBei-ObserverLog"
                         );
-
                         thread.setDaemon(true);
-
-                        try {
-                            thread.setPriority(
-                                    Thread.NORM_PRIORITY
-                            );
-                        } catch (SecurityException ignored) {
-                        }
-
                         return thread;
                     }
                 },
@@ -82,26 +74,25 @@ final class SystemServerHookInstaller {
     }
 
     void install() {
-        hookForegroundActivityState();
+        hookComputeProcessActivityState();
     }
 
     /**
-     * Hook ProcessStateRecord.setHasForegroundActivities(boolean)。
+     * 观察 WindowProcessController 的 Activity 可见状态变化。
      *
-     * 观察 AMS 对进程前台 Activity 状态的更新。
-     * 不修改参数、不改变原方法行为。
+     * 原方法执行前读取旧 flags；
+     * 原方法执行后读取新 flags；
+     * 只记录目标应用的可见状态变化。
+     *
+     * 不修改参数、不修改返回值、不改变系统行为。
      */
-    private void hookForegroundActivityState() {
+    private void hookComputeProcessActivityState() {
 
         final Method targetMethod;
 
-        /*
-         * 第一阶段：定位目标方法。
-         */
         try {
-
             Class<?> ownerClass = Class.forName(
-                    PROCESS_STATE,
+                    WPC_CLASS,
                     false,
                     classLoader
             );
@@ -109,211 +100,163 @@ final class SystemServerHookInstaller {
             targetMethod = findTargetMethod(ownerClass);
 
             if (targetMethod == null) {
-
                 module.safeLog(
                         Log.ERROR,
                         "HOOK_FAILED reason=METHOD_NOT_FOUND"
-                                + " class=" + PROCESS_STATE
+                                + " class=" + WPC_CLASS
                                 + " method=" + METHOD_NAME,
                         null
                 );
-
                 return;
             }
 
         } catch (Throwable error) {
-
             module.safeLog(
                     Log.ERROR,
                     "HOOK_FAILED stage=FIND_METHOD",
                     error
             );
-
             return;
         }
 
-        /*
-         * 第二阶段：注册 Hook。
-         */
         try {
-
             module.hook(targetMethod).intercept(chain -> {
 
-                String logMessage = null;
-                long eventTime = System.currentTimeMillis();
+                Object receiver = chain.getThisObject();
+
+                int oldFlags = Integer.MIN_VALUE;
+                boolean target = false;
+                String targetDescription = null;
 
                 try {
-
-                    /*
-                     * 首次回调确认。
-                     *
-                     * 不检查包名、PID 或状态，
-                     * 只要目标方法进入就记录。
-                     */
                     if (callbackLogged.compareAndSet(
                             false,
                             true
                     )) {
+                        String receiverName =
+                                receiver == null
+                                        ? "null"
+                                        : receiver.getClass().getName();
 
                         postLog(
-                                eventTime,
+                                System.currentTimeMillis(),
                                 "HOOK_CALLBACK"
                                         + " method=" + METHOD_NAME
-                                        + " receiver="
-                                        + chain.getThisObject()
-                                                .getClass()
-                                                .getName()
+                                        + " receiver=" + receiverName
                         );
                     }
 
-                    Object processState =
-                            chain.getThisObject();
-
                     /*
-                     * ProcessStateRecord.mApp
-                     * 对应 ProcessRecord。
+                     * 先识别目标 WPC。
                      */
-                    Object processRecord =
-                            SafeReflection.readField(
-                                    processState,
-                                    "mApp"
-                            );
+                    target = ProcessSnapshot.isTargetWpc(receiver);
 
-                    /*
-                     * 只观察目标应用。
-                     */
-                    if (ProcessSnapshot.isTargetProcessRecord(
-                            processRecord
-                    )) {
+                    if (target) {
+                        oldFlags = SafeReflection.readInt(
+                                receiver,
+                                "mActivityStateFlags",
+                                Integer.MIN_VALUE
+                        );
 
-                        Object arg = chain.getArg(0);
-
-                        boolean nextState =
-                                arg instanceof Boolean
-                                        && (Boolean) arg;
-
-                        Object oldValue =
-                                SafeReflection.readField(
-                                        processState,
-                                        "mHasForegroundActivities"
-                                );
-
-                        int pid =
-                                SafeReflection.readInt(
-                                        processRecord,
-                                        "mPid",
-                                        -1
-                                );
-
-                        String packageName =
-                                readPackageName(processRecord);
-
-                        /*
-                         * 首次识别目标进程时输出一次。
-                         *
-                         * 即使 PID 或旧状态读取失败，
-                         * 也能看到目标进程是否被识别。
-                         */
                         if (targetLogged.compareAndSet(
                                 false,
                                 true
                         )) {
-
-                            postLog(
-                                    eventTime,
-                                    "HOOK_TARGET"
-                                            + " package=" + packageName
-                                            + " pid=" + pid
-                                            + " oldState=" + oldValue
-                                            + " newState=" + arg
-                            );
-                        }
-
-                        /*
-                         * 只有旧状态确实是 Boolean，
-                         * 且新旧状态不同，才输出状态变化。
-                         *
-                         * 不再要求 pid > 0。
-                         */
-                        if (oldValue instanceof Boolean
-                                && arg instanceof Boolean) {
-
-                            boolean oldState =
-                                    (Boolean) oldValue;
-
-                            if (oldState != nextState) {
-
-                                String event =
-                                        nextState
-                                                ? "[前台] "
-                                                : "[后台] ";
-
-                                logMessage =
-                                        event
-                                                + packageName
-                                                + " (pid "
-                                                + pid
-                                                + ")";
-
-                                eventTime =
-                                        System.currentTimeMillis();
-                            }
+                            targetDescription =
+                                    ProcessSnapshot.describeWpc(
+                                            "HOOK_TARGET",
+                                            receiver
+                                    );
                         }
                     }
 
                 } catch (Throwable error) {
-
-                    /*
-                     * 观察逻辑异常只报告一次。
-                     * 不允许影响原方法执行。
-                     */
-                    if (callbackErrorLogged.compareAndSet(
-                            false,
-                            true
-                    )) {
-
-                        module.safeLog(
-                                Log.ERROR,
-                                "HOOK_ERROR stage=CALLBACK",
-                                error
-                        );
-                    }
+                    reportCallbackError(error);
                 }
 
                 /*
-                 * 原方法正常执行。
+                 * 必须执行原方法。
                  */
                 Object result = chain.proceed();
 
                 /*
-                 * 原方法执行完成后提交状态变化日志。
+                 * 原方法执行后读取新状态。
                  */
-                if (logMessage != null) {
+                if (target) {
+                    try {
+                        int newFlags = SafeReflection.readInt(
+                                receiver,
+                                "mActivityStateFlags",
+                                Integer.MIN_VALUE
+                        );
 
-                    postLog(
-                            eventTime,
-                            logMessage
-                    );
+                        if (targetDescription != null) {
+                            postLog(
+                                    System.currentTimeMillis(),
+                                    targetDescription
+                                            + " oldFlags=0x"
+                                            + Integer.toHexString(oldFlags)
+                                            + " newFlags=0x"
+                                            + Integer.toHexString(newFlags)
+                            );
+                        }
+
+                        /*
+                         * 只有新旧 flags 都成功读取，
+                         * 才判断前后台状态。
+                         */
+                        if (oldFlags != Integer.MIN_VALUE
+                                && newFlags != Integer.MIN_VALUE) {
+
+                            boolean wasVisible =
+                                    (oldFlags & VISIBLE_MASK) != 0;
+
+                            boolean isVisible =
+                                    (newFlags & VISIBLE_MASK) != 0;
+
+                            if (wasVisible != isVisible) {
+
+                                String description =
+                                        ProcessSnapshot.describeWpc(
+                                                isVisible
+                                                        ? "[前台]"
+                                                        : "[后台]",
+                                                receiver
+                                        );
+
+                                postLog(
+                                        System.currentTimeMillis(),
+                                        description
+                                                + " oldVisible="
+                                                + wasVisible
+                                                + " newVisible="
+                                                + isVisible
+                                                + " oldFlags=0x"
+                                                + Integer.toHexString(oldFlags)
+                                                + " newFlags=0x"
+                                                + Integer.toHexString(newFlags)
+                                );
+                            }
+                        }
+
+                    } catch (Throwable error) {
+                        reportCallbackError(error);
+                    }
                 }
 
                 return result;
             });
 
-            /*
-             * 只有 intercept 正常返回后，
-             * 才报告 Hook 注册成功。
-             */
             module.safeLog(
                     Log.INFO,
                     "HOOK_OK"
-                            + " class=" + PROCESS_STATE
+                            + " class=" + WPC_CLASS
                             + " method=" + METHOD_NAME
-                            + "(boolean)",
+                            + "()",
                     null
             );
 
         } catch (Throwable error) {
-
             module.safeLog(
                     Log.ERROR,
                     "HOOK_FAILED stage=REGISTER"
@@ -323,27 +266,20 @@ final class SystemServerHookInstaller {
         }
     }
 
-    /**
-     * 精确查找 setHasForegroundActivities(boolean)。
-     */
     private static Method findTargetMethod(
             Class<?> ownerClass
     ) {
-
         for (Method method : ownerClass.getDeclaredMethods()) {
 
             if (!METHOD_NAME.equals(method.getName())) {
                 continue;
             }
 
-            Class<?>[] parameters =
-                    method.getParameterTypes();
-
-            if (parameters.length != 1) {
+            if (method.getParameterTypes().length != 0) {
                 continue;
             }
 
-            if (parameters[0] != boolean.class) {
+            if (method.getReturnType() != void.class) {
                 continue;
             }
 
@@ -353,63 +289,34 @@ final class SystemServerHookInstaller {
         return null;
     }
 
-    /**
-     * 获取目标进程所属包名。
-     */
-    private static String readPackageName(
-            Object processRecord
-    ) {
-
-        Object appInfo =
-                SafeReflection.readField(
-                        processRecord,
-                        "info"
-                );
-
-        String packageName =
-                SafeReflection.readString(
-                        appInfo,
-                        "packageName"
-                );
-
-        if (packageName == null
-                || packageName.isEmpty()) {
-
-            return ProcessSnapshot.TARGET_PACKAGE;
+    private void reportCallbackError(Throwable error) {
+        if (callbackErrorLogged.compareAndSet(false, true)) {
+            module.safeLog(
+                    Log.ERROR,
+                    "HOOK_ERROR stage=CALLBACK",
+                    error
+            );
         }
-
-        return packageName;
     }
 
-    /**
-     * 异步提交日志。
-     */
     private void postLog(
             long eventTime,
             String message
     ) {
-
         try {
-
             logExecutor.execute(() -> {
-
                 try {
-
                     String timestamp =
-                            timeFormat.format(
-                                    new Date(eventTime)
-                            );
+                            timeFormat.format(new Date(eventTime));
 
                     module.safeLog(
                             Log.INFO,
                             timestamp + " " + message,
                             null
                     );
-
                 } catch (Throwable ignored) {
                 }
             });
-
         } catch (RuntimeException ignored) {
         }
     }
