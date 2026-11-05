@@ -47,6 +47,9 @@ final class SystemServerHookInstaller {
     private static final String PROCESS_STATS =
             "com.android.server.am.ProcessStatsService";
 
+    private static final String ANDROID_PROCESS =
+            "android.os.Process";
+
     private static final File LOG_FILE =
             new File("/storage/emulated/0/Android/滚木碑.log");
 
@@ -80,6 +83,25 @@ final class SystemServerHookInstaller {
 
     private final Set<String> reportedStateReadFailures =
             ConcurrentHashMap.newKeySet();
+
+    /*
+     * 目标应用 PID -> ProcessRecord 弱引用。
+     *
+     * 不强引用 ProcessRecord，避免影响对象回收。
+     * PID 变化和进程清理时主动移除旧映射。
+     */
+    private final ConcurrentHashMap<Integer, WeakReference<Object>>
+            targetProcessRecordsByPid =
+            new ConcurrentHashMap<>();
+
+    /*
+     * 记录目标进程上一次成功设置的 process group。
+     *
+     * 只在 group 发生变化时输出日志，避免重复刷屏。
+     */
+    private final ConcurrentHashMap<Integer, Integer>
+            lastObservedProcessGroups =
+            new ConcurrentHashMap<>();
 
     SystemServerHookInstaller(
             ModuleEntry module,
@@ -175,41 +197,19 @@ final class SystemServerHookInstaller {
                 }
         );
 
-        hookAfter(
-                PROCESS_RECORD,
-                "setPid",
-                new String[]{"int"},
-                chain -> {
+        /*
+         * 先建立 ProcessRecord -> PID 映射。
+         */
+        hookProcessPidSetter();
 
-                    Object processRecord =
-                            chain.getThisObject();
+        /*
+         * 观察 android.os.Process.setProcessGroup。
+         */
+        hookProcessGroup();
 
-                    if (!ProcessSnapshot.isTargetProcessRecord(
-                            processRecord
-                    )) {
-                        return;
-                    }
-
-                    Object arg = chain.getArg(0);
-
-                    String requestedPid =
-                            arg instanceof Number
-                                    ? Integer.toString(
-                                            ((Number) arg).intValue()
-                                    )
-                                    : "unknown";
-
-                    postLog(
-                            Log.INFO,
-                            ProcessSnapshot.describeProcessRecord(
-                                    "PROCESS_PID_SET requestedPid="
-                                            + requestedPid,
-                                    processRecord
-                            )
-                    );
-                }
-        );
-
+        /*
+         * 进程清理时移除 PID 映射。
+         */
         hookCleanup();
 
         hookProcessStateSetter(
@@ -314,6 +314,373 @@ final class SystemServerHookInstaller {
         } catch (Throwable error) {
 
             disableFileLogging(error);
+        }
+    }
+
+    /**
+     * Hook ProcessRecord.setPid。
+     *
+     * 在原方法执行前保存旧 PID，
+     * 原方法成功后更新目标应用 PID 映射。
+     */
+    private void hookProcessPidSetter() {
+
+        hookMethod(
+                PROCESS_RECORD,
+                "setPid",
+                new String[]{"int"},
+                method -> {
+
+                    module.hook(method).intercept(chain -> {
+
+                        Object processRecord =
+                                chain.getThisObject();
+
+                        boolean target =
+                                ProcessSnapshot.isTargetProcessRecord(
+                                        processRecord
+                                );
+
+                        int oldPid = target
+                                ? SafeReflection.readInt(
+                                        processRecord,
+                                        "mPid",
+                                        UNKNOWN
+                                )
+                                : UNKNOWN;
+
+                        Object arg = chain.getArg(0);
+
+                        int requestedPid =
+                                arg instanceof Number
+                                        ? ((Number) arg).intValue()
+                                        : UNKNOWN;
+
+                        /*
+                         * 原方法异常时不更新映射。
+                         */
+                        Object result = chain.proceed();
+
+                        if (!target) {
+                            return result;
+                        }
+
+                        int newPid = requestedPid;
+
+                        if (newPid == UNKNOWN) {
+
+                            newPid = SafeReflection.readInt(
+                                    processRecord,
+                                    "mPid",
+                                    UNKNOWN
+                            );
+                        }
+
+                        /*
+                         * PID 发生变化时先清除旧映射。
+                         */
+                        if (oldPid > 0
+                                && oldPid != newPid) {
+
+                            removeTrackedTargetPid(
+                                    oldPid,
+                                    processRecord
+                            );
+                        }
+
+                        if (newPid > 0) {
+
+                            WeakReference<Object> oldReference =
+                                    targetProcessRecordsByPid.put(
+                                            newPid,
+                                            new WeakReference<>(
+                                                    processRecord
+                                            )
+                                    );
+
+                            /*
+                             * PID 被新 ProcessRecord 复用时，
+                             * 清除旧的 group 缓存。
+                             */
+                            if (oldReference == null
+                                    || oldReference.get()
+                                    != processRecord) {
+
+                                lastObservedProcessGroups.remove(
+                                        newPid
+                                );
+                            }
+
+                        } else if (oldPid > 0) {
+
+                            removeTrackedTargetPid(
+                                    oldPid,
+                                    processRecord
+                            );
+                        }
+
+                        postLog(
+                                Log.INFO,
+                                ProcessSnapshot.describeProcessRecord(
+                                        "PROCESS_PID_SET requestedPid="
+                                                + requestedPid,
+                                        processRecord
+                                )
+                        );
+
+                        return result;
+                    });
+                }
+        );
+    }
+
+    /**
+     * 观察目标进程的 process group 变化。
+     *
+     * 这里只调用原方法，不修改参数、不阻止原方法执行。
+     * 只有原方法正常返回后才记录成功事件。
+     */
+    private void hookProcessGroup() {
+
+        hookMethod(
+                ANDROID_PROCESS,
+                "setProcessGroup",
+                new String[]{"int", "int"},
+                method -> {
+
+                    module.hook(method).intercept(chain -> {
+
+                        Object pidArg = chain.getArg(0);
+                        Object groupArg = chain.getArg(1);
+
+                        if (!(pidArg instanceof Number)
+                                || !(groupArg instanceof Number)) {
+
+                            return chain.proceed();
+                        }
+
+                        int pid =
+                                ((Number) pidArg).intValue();
+
+                        int group =
+                                ((Number) groupArg).intValue();
+
+                        if (pid <= 0) {
+                            return chain.proceed();
+                        }
+
+                        WeakReference<Object> reference =
+                                targetProcessRecordsByPid.get(pid);
+
+                        Object processRecord =
+                                reference == null
+                                        ? null
+                                        : reference.get();
+
+                        /*
+                         * 非目标进程不记录。
+                         */
+                        if (processRecord == null) {
+
+                            if (reference != null) {
+
+                                targetProcessRecordsByPid.remove(
+                                        pid,
+                                        reference
+                                );
+
+                                lastObservedProcessGroups.remove(pid);
+                            }
+
+                            return chain.proceed();
+                        }
+
+                        if (!ProcessSnapshot.isTargetProcessRecord(
+                                processRecord
+                        )) {
+
+                            removeTrackedTargetPid(
+                                    pid,
+                                    processRecord
+                            );
+
+                            return chain.proceed();
+                        }
+
+                        /*
+                         * 检查 PID 与 ProcessRecord 当前身份是否一致。
+                         * 防止 PID 复用或清理过程中的旧映射串号。
+                         */
+                        int recordPid =
+                                SafeReflection.readInt(
+                                        processRecord,
+                                        "mPid",
+                                        UNKNOWN
+                                );
+
+                        if (recordPid != UNKNOWN
+                                && recordPid != pid) {
+
+                            removeTrackedTargetPid(
+                                    pid,
+                                    processRecord
+                            );
+
+                            return chain.proceed();
+                        }
+
+                        /*
+                         * 先执行 Android 原生方法。
+                         *
+                         * 若 SetTaskProfiles 等操作失败并抛出异常，
+                         * 不会被错误记录成成功迁移。
+                         */
+                        Object result = chain.proceed();
+
+                        Integer previousGroup =
+                                lastObservedProcessGroups.put(
+                                        pid,
+                                        group
+                                );
+
+                        /*
+                         * 只有 group 确实发生变化才输出。
+                         */
+                        if (previousGroup == null
+                                || previousGroup.intValue() != group) {
+
+                            String oldGroupName =
+                                    previousGroup == null
+                                            ? "UNKNOWN"
+                                            : processGroupName(
+                                                    previousGroup
+                                            );
+
+                            String newGroupName =
+                                    processGroupName(group);
+
+                            String profileHint =
+                                    processGroupProfileHint(group);
+
+                            postLog(
+                                    Log.INFO,
+                                    ProcessSnapshot.describeProcessRecord(
+                                            "CPUSET_GROUP_APPLIED"
+                                                    + " requestedPid=" + pid
+                                                    + " oldGroup="
+                                                    + oldGroupName
+                                                    + "(" + previousGroup + ")"
+                                                    + " newGroup="
+                                                    + newGroupName
+                                                    + "(" + group + ")"
+                                                    + " profileHint="
+                                                    + profileHint,
+                                            processRecord
+                                    )
+                            );
+                        }
+
+                        return result;
+                    });
+                }
+        );
+    }
+
+    /**
+     * 将 group 数值转换成 Android 调度组名称。
+     */
+    private static String processGroupName(int group) {
+
+        switch (group) {
+
+            case -1:
+                return "DEFAULT";
+
+            case 0:
+                return "BACKGROUND";
+
+            case 1:
+                return "FOREGROUND_RESERVED";
+
+            case 2:
+                return "SYSTEM";
+
+            case 3:
+                return "AUDIO_APP";
+
+            case 4:
+                return "AUDIO_SYS";
+
+            case 5:
+                return "TOP_APP";
+
+            case 6:
+                return "RT_APP";
+
+            case 7:
+                return "RESTRICTED";
+
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    /**
+     * 仅给出 AOSP 默认配置中有明确对应关系的 profile 提示。
+     *
+     * 这不是对厂商实际配置的保证。
+     */
+    private static String processGroupProfileHint(int group) {
+
+        switch (group) {
+
+            case 0:
+                return "CPUSET_SP_BACKGROUND";
+
+            case 5:
+                return "CPUSET_SP_TOP_APP";
+
+            case 7:
+                return "CPUSET_SP_RESTRICTED";
+
+            case -1:
+                return "DEFAULT_MIXED_POLICY";
+
+            default:
+                return "UNKNOWN_OR_DEVICE_SPECIFIC";
+        }
+    }
+
+    /**
+     * 移除指定 ProcessRecord 对应的 PID 映射。
+     *
+     * 必须同时验证弱引用指向的对象身份，
+     * 避免旧 ProcessRecord 清理时误删已经复用的 PID。
+     */
+    private void removeTrackedTargetPid(
+            int pid,
+            Object processRecord
+    ) {
+
+        if (pid <= 0 || processRecord == null) {
+            return;
+        }
+
+        WeakReference<Object> reference =
+                targetProcessRecordsByPid.get(pid);
+
+        if (reference == null) {
+            return;
+        }
+
+        if (reference.get() == processRecord) {
+
+            targetProcessRecordsByPid.remove(
+                    pid,
+                    reference
+            );
+
+            lastObservedProcessGroups.remove(pid);
         }
     }
 
@@ -431,6 +798,14 @@ final class SystemServerHookInstaller {
                                         processRecord
                                 );
 
+                        int trackedPid = target
+                                ? SafeReflection.readInt(
+                                        processRecord,
+                                        "mPid",
+                                        UNKNOWN
+                                )
+                                : UNKNOWN;
+
                         String before = target
                                 ? ProcessSnapshot.describeProcessRecord(
                                         "PROCESS_CLEANUP_PRE_SNAPSHOT",
@@ -466,6 +841,16 @@ final class SystemServerHookInstaller {
                             }
 
                             throw originalError;
+
+                        } finally {
+
+                            if (trackedPid > 0) {
+
+                                removeTrackedTargetPid(
+                                        trackedPid,
+                                        processRecord
+                                );
+                            }
                         }
                     });
                 }
