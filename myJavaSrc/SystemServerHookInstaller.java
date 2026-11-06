@@ -15,25 +15,19 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 final class SystemServerHookInstaller {
 
-    private static final String TAG_ACTIVITY =
-            "com.android.server.wm.ActivityRecord";
-
-    private static final String TAG_ACTIVITY_STATE =
-            "com.android.server.wm.ActivityRecord$State";
-
-    private static final String TAG_ATMS =
-            "com.android.server.wm.ActivityTaskManagerService";
-
-    private static final String TAG_TASK =
-            "com.android.server.wm.Task";
-
     private static final String TAG_TASK_FRAGMENT =
             "com.android.server.wm.TaskFragment";
 
-    private static final String TAG_DISPLAY_CONTENT =
-            "com.android.server.wm.DisplayContent";
+    private static final String TAG_ACTIVITY =
+            "com.android.server.wm.ActivityRecord";
 
-    private static final String TAG_PROCESS_STATE_RECORD =
+    private static final String TAG_SUPERVISOR =
+            "com.android.server.wm.ActivityTaskSupervisor";
+
+    private static final String TAG_WPC =
+            "com.android.server.wm.WindowProcessController";
+
+    private static final String TAG_PROCESS_STATE =
             "com.android.server.am.ProcessStateRecord";
 
     private static final Object READ_FAILED = new Object();
@@ -110,35 +104,19 @@ final class SystemServerHookInstaller {
     void install() {
 
         /*
-         * 主要前台快速入口：
-         * Task 开始移动到前面时触发。
+         * 最直接的 Activity resumed 变化入口。
          */
-        hookTaskMoveToFront();
+        hookSetResumedActivity();
 
         /*
-         * Activity 开始恢复时的快速入口。
+         * Top-resumed 状态变化入口。
          */
-        hookResumeTopActivity();
+        hookUpdateTopResumedActivity();
 
         /*
-         * WindowManager 设置目标应用焦点。
+         * OOM 更新之前的关键快速入口。
          */
-        hookDisplayFocusedApp();
-
-        /*
-         * Activity 生命周期兜底。
-         */
-        hookActivityState();
-
-        /*
-         * Activity 可见性兜底。
-         */
-        hookVisibleRequested();
-
-        /*
-         * ATMS Top-resumed 兜底。
-         */
-        hookTopAppUpdate();
+        hookAddToPendingTop();
 
         /*
          * 后台调度组确认。
@@ -153,122 +131,20 @@ final class SystemServerHookInstaller {
     }
 
     // ============================================================
-    // Hook 1：Task.moveToFrontInner
+    // Hook 1：
+    // TaskFragment.setResumedActivity(ActivityRecord, String)
     //
-    // 主要前台触发入口。
+    // 该方法内部先更新 mResumedActivity，
+    // 然后才调用 ActivityTaskSupervisor
+    // .updateTopResumedActivityIfNeeded()。
     //
-    // 在系统调整 Task 顺序之前，
-    // 获取这个 Task 当前的顶部 Activity。
+    // 因此在这里前置识别目标 Activity，
+    // 不需要等待后续 OOM 调度。
     // ============================================================
 
-    private void hookTaskMoveToFront() {
+    private void hookSetResumedActivity() {
 
-        final Method moveMethod;
-
-        final Method topActivityMethod;
-
-        try {
-            Class<?> taskClass = Class.forName(
-                    TAG_TASK,
-                    false,
-                    classLoader
-            );
-
-            moveMethod = taskClass.getDeclaredMethod(
-                    "moveToFrontInner",
-                    String.class,
-                    taskClass
-            );
-
-            topActivityMethod =
-                    taskClass.getDeclaredMethod(
-                            "topRunningActivityLocked"
-                    );
-
-            if (moveMethod.getReturnType() != void.class
-                    || topActivityMethod.getReturnType() !=
-                    Class.forName(
-                            TAG_ACTIVITY,
-                            false,
-                            classLoader
-                    )) {
-
-                throw new IllegalStateException(
-                        "Unexpected Task method signature"
-                );
-            }
-
-            moveMethod.setAccessible(true);
-            topActivityMethod.setAccessible(true);
-
-        } catch (Throwable error) {
-
-            module.safeLog(
-                    Log.ERROR,
-                    "TASK_MOVE_TO_FRONT_HOOK_FAILED"
-                            + " stage=FIND_METHOD",
-                    error
-            );
-
-            return;
-        }
-
-        try {
-            module.hook(moveMethod).intercept(chain -> {
-
-                /*
-                 * 必须在原方法执行之前识别。
-                 */
-                try {
-                    Object task = chain.getThisObject();
-
-                    Object activity =
-                            topActivityMethod.invoke(task);
-
-                    publishForegroundIfTargetActivity(
-                            activity,
-                            "Task.moveToFrontInner"
-                    );
-
-                } catch (Throwable error) {
-
-                    reportCallbackError(error);
-                }
-
-                return chain.proceed();
-            });
-
-            module.safeLog(
-                    Log.INFO,
-                    "TASK_MOVE_TO_FRONT_HOOK_OK"
-                            + " method=Task.moveToFrontInner"
-                            + " timing=BEFORE_PROCEED",
-                    null
-            );
-
-        } catch (Throwable error) {
-
-            module.safeLog(
-                    Log.ERROR,
-                    "TASK_MOVE_TO_FRONT_HOOK_FAILED"
-                            + " stage=REGISTER",
-                    error
-            );
-        }
-    }
-
-    // ============================================================
-    // Hook 2：TaskFragment.resumeTopActivity
-    //
-    // 在真正开始恢复顶部 Activity 时，
-    // 直接识别即将恢复的目标 Activity。
-    // ============================================================
-
-    private void hookResumeTopActivity() {
-
-        final Method resumeMethod;
-
-        final Method topActivityMethod;
+        final Method targetMethod;
 
         try {
             Class<?> fragmentClass = Class.forName(
@@ -277,48 +153,31 @@ final class SystemServerHookInstaller {
                     classLoader
             );
 
-            Class<?> activityRecordClass = Class.forName(
+            Class<?> activityClass = Class.forName(
                     TAG_ACTIVITY,
                     false,
                     classLoader
             );
 
-            Class<?> optionsClass = Class.forName(
-                    "android.app.ActivityOptions",
-                    false,
-                    classLoader
+            targetMethod = fragmentClass.getDeclaredMethod(
+                    "setResumedActivity",
+                    activityClass,
+                    String.class
             );
 
-            resumeMethod = fragmentClass.getDeclaredMethod(
-                    "resumeTopActivity",
-                    activityRecordClass,
-                    optionsClass,
-                    boolean.class
-            );
-
-            topActivityMethod =
-                    fragmentClass.getDeclaredMethod(
-                            "topRunningActivity",
-                            boolean.class
-                    );
-
-            if (resumeMethod.getReturnType() != boolean.class
-                    || topActivityMethod.getReturnType() !=
-                    activityRecordClass) {
-
+            if (targetMethod.getReturnType() != void.class) {
                 throw new IllegalStateException(
-                        "Unexpected TaskFragment method signature"
+                        "Invalid setResumedActivity return type"
                 );
             }
 
-            resumeMethod.setAccessible(true);
-            topActivityMethod.setAccessible(true);
+            targetMethod.setAccessible(true);
 
         } catch (Throwable error) {
 
             module.safeLog(
                     Log.ERROR,
-                    "RESUME_TOP_ACTIVITY_HOOK_FAILED"
+                    "SET_RESUMED_ACTIVITY_HOOK_FAILED"
                             + " stage=FIND_METHOD",
                     error
             );
@@ -327,26 +186,18 @@ final class SystemServerHookInstaller {
         }
 
         try {
-            module.hook(resumeMethod).intercept(chain -> {
+            module.hook(targetMethod).intercept(chain -> {
 
                 try {
-                    Object fragment = chain.getThisObject();
+                    Object activity = chain.getArg(0);
 
                     /*
-                     * TaskFragment.resumeTopActivity 内部
-                     * 首先也是通过 topRunningActivity(true)
-                     * 获取即将恢复的 Activity。
-                     *
-                     * 这里提前执行同样的查询。
+                     * null 表示清除当前 Resumed Activity，
+                     * 不代表目标应用进入前台。
                      */
-                    Object activity = topActivityMethod.invoke(
-                            fragment,
-                            Boolean.TRUE
-                    );
-
                     publishForegroundIfTargetActivity(
                             activity,
-                            "TaskFragment.resumeTopActivity"
+                            "TaskFragment.setResumedActivity"
                     );
 
                 } catch (Throwable error) {
@@ -359,8 +210,8 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.INFO,
-                    "RESUME_TOP_ACTIVITY_HOOK_OK"
-                            + " method=TaskFragment.resumeTopActivity"
+                    "SET_RESUMED_ACTIVITY_HOOK_OK"
+                            + " method=TaskFragment.setResumedActivity"
                             + " timing=BEFORE_PROCEED",
                     null
             );
@@ -369,7 +220,7 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.ERROR,
-                    "RESUME_TOP_ACTIVITY_HOOK_FAILED"
+                    "SET_RESUMED_ACTIVITY_HOOK_FAILED"
                             + " stage=REGISTER",
                     error
             );
@@ -377,39 +228,36 @@ final class SystemServerHookInstaller {
     }
 
     // ============================================================
-    // Hook 3：DisplayContent.setFocusedApp
+    // Hook 2：
+    // ActivityTaskSupervisor.updateTopResumedActivityIfNeeded
     //
-    // 只在焦点设置为目标 Activity 时触发前台。
+    // 在原方法执行之前，从当前 RootWindowContainer
+    // 获取系统即将使用的 Top Display Focused Root Task，
+    // 再获取它的 Top Resumed Activity。
     //
-    // 焦点转移到其他应用时不处理，
-    // 因为失焦不能证明目标应用已经进入后台。
+    // 这个检查发生在原方法内部 updateOomAdj() 之前。
     // ============================================================
 
-    private void hookDisplayFocusedApp() {
+    private void hookUpdateTopResumedActivity() {
 
         final Method targetMethod;
 
         try {
-            Class<?> displayClass = Class.forName(
-                    TAG_DISPLAY_CONTENT,
+            Class<?> supervisorClass = Class.forName(
+                    TAG_SUPERVISOR,
                     false,
                     classLoader
             );
 
-            Class<?> activityRecordClass = Class.forName(
-                    TAG_ACTIVITY,
-                    false,
-                    classLoader
-            );
+            targetMethod =
+                    supervisorClass.getDeclaredMethod(
+                            "updateTopResumedActivityIfNeeded",
+                            String.class
+                    );
 
-            targetMethod = displayClass.getDeclaredMethod(
-                    "setFocusedApp",
-                    activityRecordClass
-            );
-
-            if (targetMethod.getReturnType() != boolean.class) {
+            if (targetMethod.getReturnType() != void.class) {
                 throw new IllegalStateException(
-                        "Invalid setFocusedApp return type"
+                        "Invalid updateTopResumedActivityIfNeeded return type"
                 );
             }
 
@@ -419,7 +267,7 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.ERROR,
-                    "DISPLAY_FOCUSED_APP_HOOK_FAILED"
+                    "UPDATE_TOP_RESUMED_HOOK_FAILED"
                             + " stage=FIND_METHOD",
                     error
             );
@@ -431,11 +279,43 @@ final class SystemServerHookInstaller {
             module.hook(targetMethod).intercept(chain -> {
 
                 try {
-                    Object activity = chain.getArg(0);
+                    Object supervisor = chain.getThisObject();
+
+                    Object root = readFieldStrict(
+                            supervisor,
+                            "mRootWindowContainer"
+                    );
+
+                    if (root == READ_FAILED || root == null) {
+                        return chain.proceed();
+                    }
+
+                    /*
+                     * 获取系统当前 Top Display Focused Root Task。
+                     */
+                    Object topRootTask =
+                            SafeReflection.invokeNoArg(
+                                    root,
+                                    "getTopDisplayFocusedRootTask"
+                            );
+
+                    if (topRootTask == null) {
+                        return chain.proceed();
+                    }
+
+                    /*
+                     * 获取该 Task 的 Top Resumed Activity。
+                     */
+                    Object activity =
+                            SafeReflection.invokeNoArg(
+                                    topRootTask,
+                                    "getTopResumedActivity"
+                            );
 
                     publishForegroundIfTargetActivity(
                             activity,
-                            "DisplayContent.setFocusedApp"
+                            "ActivityTaskSupervisor."
+                                    + "updateTopResumedActivityIfNeeded"
                     );
 
                 } catch (Throwable error) {
@@ -448,9 +328,8 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.INFO,
-                    "DISPLAY_FOCUSED_APP_HOOK_OK"
-                            + " method=DisplayContent.setFocusedApp"
-                            + " mode=TARGET_ONLY",
+                    "UPDATE_TOP_RESUMED_HOOK_OK"
+                            + " timing=BEFORE_PROCEED",
                     null
             );
 
@@ -458,7 +337,7 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.ERROR,
-                    "DISPLAY_FOCUSED_APP_HOOK_FAILED"
+                    "UPDATE_TOP_RESUMED_HOOK_FAILED"
                             + " stage=REGISTER",
                     error
             );
@@ -466,33 +345,42 @@ final class SystemServerHookInstaller {
     }
 
     // ============================================================
-    // Hook 4：ActivityRecord.setState
+    // Hook 3：
+    // WindowProcessController.addToPendingTop()
     //
-    // RESUMED 时前台兜底。
+    // 这是本次最重要的快速入口。
+    //
+    // 仓库中的真实调用顺序：
+    //
+    // 1. ActivityTaskSupervisor 更新 mTopResumedActivity
+    // 2. 调用目标 WPC.addToPendingTop()
+    // 3. 调用 ActivityTaskManagerService.updateOomAdj()
+    // 4. 后续才调用 updateTopApp()
+    //
+    // 因此在这里识别目标进程，
+    // 可以避开 updateOomAdj() 的耗时。
     // ============================================================
 
-    private void hookActivityState() {
+    private void hookAddToPendingTop() {
 
         final Method targetMethod;
 
         try {
-            Class<?> activityRecordClass = Class.forName(
-                    TAG_ACTIVITY,
+            Class<?> wpcClass = Class.forName(
+                    TAG_WPC,
                     false,
                     classLoader
             );
 
-            Class<?> stateClass = Class.forName(
-                    TAG_ACTIVITY_STATE,
-                    false,
-                    classLoader
+            targetMethod = wpcClass.getDeclaredMethod(
+                    "addToPendingTop"
             );
 
-            targetMethod = activityRecordClass.getDeclaredMethod(
-                    "setState",
-                    stateClass,
-                    String.class
-            );
+            if (targetMethod.getReturnType() != void.class) {
+                throw new IllegalStateException(
+                        "Invalid addToPendingTop return type"
+                );
+            }
 
             targetMethod.setAccessible(true);
 
@@ -500,7 +388,7 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.ERROR,
-                    "ACTIVITY_STATE_HOOK_FAILED"
+                    "ADD_PENDING_TOP_HOOK_FAILED"
                             + " stage=FIND_METHOD",
                     error
             );
@@ -512,16 +400,16 @@ final class SystemServerHookInstaller {
             module.hook(targetMethod).intercept(chain -> {
 
                 try {
-                    Object nextState = chain.getArg(0);
+                    /*
+                     * addToPendingTop() 的 this 就是目标 WPC。
+                     */
+                    Object wpc = chain.getThisObject();
 
-                    if (nextState instanceof Enum<?>
-                            && "RESUMED".equals(
-                                    ((Enum<?>) nextState).name()
-                            )) {
+                    if (isTargetMainWpc(wpc)) {
 
-                        publishForegroundIfTargetActivity(
-                                chain.getThisObject(),
-                                "ActivityRecord.setState(RESUMED)"
+                        publishForeground(
+                                "WindowProcessController.addToPendingTop",
+                                GROUP_UNKNOWN
                         );
                     }
 
@@ -530,13 +418,16 @@ final class SystemServerHookInstaller {
                     reportCallbackError(error);
                 }
 
+                /*
+                 * 继续执行系统原方法。
+                 */
                 return chain.proceed();
             });
 
             module.safeLog(
                     Log.INFO,
-                    "ACTIVITY_STATE_HOOK_OK"
-                            + " method=ActivityRecord.setState",
+                    "ADD_PENDING_TOP_HOOK_OK"
+                            + " timing=BEFORE_PROCEED",
                     null
             );
 
@@ -544,188 +435,23 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.ERROR,
-                    "ACTIVITY_STATE_HOOK_FAILED stage=REGISTER",
+                    "ADD_PENDING_TOP_HOOK_FAILED"
+                            + " stage=REGISTER",
                     error
             );
         }
     }
 
     // ============================================================
-    // Hook 5：ActivityRecord.setVisibleRequested
-    // ============================================================
-
-    private void hookVisibleRequested() {
-
-        final Method targetMethod;
-
-        try {
-            Class<?> activityRecordClass = Class.forName(
-                    TAG_ACTIVITY,
-                    false,
-                    classLoader
-            );
-
-            targetMethod = activityRecordClass.getDeclaredMethod(
-                    "setVisibleRequested",
-                    boolean.class
-            );
-
-            targetMethod.setAccessible(true);
-
-        } catch (Throwable error) {
-
-            module.safeLog(
-                    Log.ERROR,
-                    "VISIBLE_REQUESTED_HOOK_FAILED"
-                            + " stage=FIND_METHOD",
-                    error
-            );
-
-            return;
-        }
-
-        try {
-            module.hook(targetMethod).intercept(chain -> {
-
-                try {
-                    Object requested = chain.getArg(0);
-
-                    if (requested instanceof Boolean
-                            && ((Boolean) requested).booleanValue()) {
-
-                        publishForegroundIfTargetActivity(
-                                chain.getThisObject(),
-                                "ActivityRecord.setVisibleRequested(true)"
-                        );
-                    }
-
-                } catch (Throwable error) {
-
-                    reportCallbackError(error);
-                }
-
-                return chain.proceed();
-            });
-
-            module.safeLog(
-                    Log.INFO,
-                    "VISIBLE_REQUESTED_HOOK_OK",
-                    null
-            );
-
-        } catch (Throwable error) {
-
-            module.safeLog(
-                    Log.ERROR,
-                    "VISIBLE_REQUESTED_HOOK_FAILED stage=REGISTER",
-                    error
-            );
-        }
-    }
-
-    // ============================================================
-    // Hook 6：ATMS.updateTopApp
+    // Hook 4：
+    // ProcessStateRecord.setCurrentSchedulingGroup(int)
     //
-    // 前台兜底。
-    // ============================================================
-
-    private void hookTopAppUpdate() {
-
-        final Method targetMethod;
-
-        try {
-            Class<?> activityRecordClass = Class.forName(
-                    TAG_ACTIVITY,
-                    false,
-                    classLoader
-            );
-
-            Class<?> serviceClass = Class.forName(
-                    TAG_ATMS,
-                    false,
-                    classLoader
-            );
-
-            targetMethod = serviceClass.getDeclaredMethod(
-                    "updateTopApp",
-                    activityRecordClass
-            );
-
-            targetMethod.setAccessible(true);
-
-        } catch (Throwable error) {
-
-            module.safeLog(
-                    Log.ERROR,
-                    "TOP_APP_HOOK_FAILED stage=FIND_METHOD",
-                    error
-            );
-
-            return;
-        }
-
-        try {
-            module.hook(targetMethod).intercept(chain -> {
-
-                try {
-                    Object activity = chain.getArg(0);
-
-                    if (activity == null) {
-
-                        Object root = readFieldStrict(
-                                chain.getThisObject(),
-                                "mRootWindowContainer"
-                        );
-
-                        if (root != READ_FAILED && root != null) {
-
-                            activity =
-                                    SafeReflection.invokeNoArg(
-                                            root,
-                                            "getTopResumedActivity"
-                                    );
-                        }
-                    }
-
-                    publishForegroundIfTargetActivity(
-                            activity,
-                            "ATMS.updateTopApp"
-                    );
-
-                } catch (Throwable error) {
-
-                    reportCallbackError(error);
-                }
-
-                return chain.proceed();
-            });
-
-            module.safeLog(
-                    Log.INFO,
-                    "TOP_APP_HOOK_OK"
-                            + " method=ATMS.updateTopApp",
-                    null
-            );
-
-        } catch (Throwable error) {
-
-            module.safeLog(
-                    Log.ERROR,
-                    "TOP_APP_HOOK_FAILED stage=REGISTER",
-                    error
-            );
-        }
-    }
-
-    // ============================================================
-    // Hook 7：ProcessStateRecord.setCurrentSchedulingGroup
+    // 只负责确认后台：
     //
-    // 只在真正发生调度组变化时发布。
+    // old != 0 && new == 0
     //
-    // 非 0 -> 0：后台
-    // 0 -> 非 0：前台兜底
-    //
-    // 0 -> 0：忽略
+    // 非 0 不再负责前台正常触发。
+    // 前台已由上面三个更早的入口处理。
     // ============================================================
 
     private void hookCurrentSchedulingGroup() {
@@ -733,16 +459,22 @@ final class SystemServerHookInstaller {
         final Method targetMethod;
 
         try {
-            Class<?> stateRecordClass = Class.forName(
-                    TAG_PROCESS_STATE_RECORD,
+            Class<?> stateClass = Class.forName(
+                    TAG_PROCESS_STATE,
                     false,
                     classLoader
             );
 
-            targetMethod = stateRecordClass.getDeclaredMethod(
+            targetMethod = stateClass.getDeclaredMethod(
                     "setCurrentSchedulingGroup",
                     int.class
             );
+
+            if (targetMethod.getReturnType() != void.class) {
+                throw new IllegalStateException(
+                        "Invalid scheduling group return type"
+                );
+            }
 
             targetMethod.setAccessible(true);
 
@@ -764,16 +496,13 @@ final class SystemServerHookInstaller {
                 Object stateRecord = chain.getThisObject();
 
                 /*
-                 * 读取旧值。
+                 * 在原方法执行前保存旧值。
                  */
                 Object oldGroupValue = readFieldStrict(
                         stateRecord,
                         "mCurSchedGroup"
                 );
 
-                /*
-                 * 读取目标值。
-                 */
                 Object newGroupValue = chain.getArg(0);
 
                 Object processRecord = readFieldStrict(
@@ -797,15 +526,15 @@ final class SystemServerHookInstaller {
                         return result;
                     }
 
+                    /*
+                     * 只监控主进程。
+                     */
                     String processName =
                             SafeReflection.readString(
                                     processRecord,
                                     "processName"
                             );
 
-                    /*
-                     * 仅处理主进程。
-                     */
                     if (!ProcessSnapshot.TARGET_PACKAGE.equals(
                             processName
                     )) {
@@ -830,30 +559,21 @@ final class SystemServerHookInstaller {
                     targetSchedulingGroup = newGroup;
 
                     /*
-                     * 没有实际变化，不触发。
+                     * 没有发生调度组变化，不触发。
                      */
                     if (oldGroup == newGroup) {
                         return result;
                     }
 
+                    /*
+                     * 只有从非后台组切换为后台组，
+                     * 才确认进入后台。
+                     */
                     if (newGroup == SCHED_GROUP_BACKGROUND) {
 
-                        /*
-                         * 只有从非后台切换到后台，
-                         * 才认定为进入后台。
-                         */
                         publishBackground(
-                                "ProcessStateRecord.setCurrentSchedulingGroup",
-                                newGroup
-                        );
-
-                    } else {
-
-                        /*
-                         * 仅作为前台兜底。
-                         */
-                        publishForeground(
-                                "ProcessStateRecord.setCurrentSchedulingGroup",
+                                "ProcessStateRecord."
+                                        + "setCurrentSchedulingGroup",
                                 newGroup
                         );
                     }
@@ -869,9 +589,8 @@ final class SystemServerHookInstaller {
             module.safeLog(
                     Log.INFO,
                     "SCHEDULING_GROUP_HOOK_OK"
-                            + " method=ProcessStateRecord."
-                            + "setCurrentSchedulingGroup"
-                            + " transitionOnly=true",
+                            + " backgroundValue=0"
+                            + " mode=BACKGROUND_ONLY",
                     null
             );
 
@@ -879,15 +598,40 @@ final class SystemServerHookInstaller {
 
             module.safeLog(
                     Log.ERROR,
-                    "SCHEDULING_GROUP_HOOK_FAILED stage=REGISTER",
+                    "SCHEDULING_GROUP_HOOK_FAILED"
+                            + " stage=REGISTER",
                     error
             );
         }
     }
 
     // ============================================================
-    // 目标 Activity 判断
+    // 目标进程判断
     // ============================================================
+
+    private boolean isTargetMainWpc(Object wpc) {
+
+        if (wpc == null) {
+            return false;
+        }
+
+        if (!ProcessSnapshot.isTargetWpc(wpc)) {
+            return false;
+        }
+
+        /*
+         * 只认主进程，不让辅助进程覆盖状态。
+         */
+        String processName =
+                SafeReflection.readString(
+                        wpc,
+                        "mName"
+                );
+
+        return ProcessSnapshot.TARGET_PACKAGE.equals(
+                processName
+        );
+    }
 
     private void publishForegroundIfTargetActivity(
             Object activity,
@@ -907,7 +651,7 @@ final class SystemServerHookInstaller {
             return;
         }
 
-        if (!ProcessSnapshot.isTargetWpc(wpc)) {
+        if (!isTargetMainWpc(wpc)) {
             return;
         }
 
@@ -964,10 +708,7 @@ final class SystemServerHookInstaller {
         String groupText =
                 eventGroup == GROUP_UNKNOWN
                         ? "unknown"
-                        : eventGroup
-                                + "("
-                                + getSchedulingGroupName(eventGroup)
-                                + ")";
+                        : Integer.toString(eventGroup);
 
         String message =
                 label
@@ -980,10 +721,6 @@ final class SystemServerHookInstaller {
                         + " source="
                         + source;
 
-        /*
-         * 状态切换在 Hook 回调中同步完成。
-         * 仅日志写入异步执行。
-         */
         postLog(
                 System.currentTimeMillis(),
                 message
@@ -995,30 +732,6 @@ final class SystemServerHookInstaller {
         return group == GROUP_UNKNOWN
                 ? "unknown"
                 : Integer.toString(group);
-    }
-
-    private static String getSchedulingGroupName(int group) {
-
-        switch (group) {
-
-            case 0:
-                return "BACKGROUND";
-
-            case 1:
-                return "RESTRICTED";
-
-            case 2:
-                return "DEFAULT";
-
-            case 3:
-                return "TOP_APP";
-
-            case 4:
-                return "TOP_APP_BOUND";
-
-            default:
-                return "NON_BACKGROUND";
-        }
     }
 
     // ============================================================
