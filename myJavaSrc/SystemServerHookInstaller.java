@@ -15,30 +15,24 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 final class SystemServerHookInstaller {
 
+    private static final String TAG_ATMS =
+            "com.android.server.wm.ActivityTaskManagerService";
+
+    private static final String TAG_ACTIVITY =
+            "com.android.server.wm.ActivityRecord";
+
     private static final String TAG_PROCESS_STATE_RECORD =
             "com.android.server.am.ProcessStateRecord";
 
-    /*
-     * ProcessList.smali 中确认：
-     *
-     * SCHED_GROUP_BACKGROUND = 0
-     * SCHED_GROUP_RESTRICTED = 1
-     * SCHED_GROUP_DEFAULT = 2
-     * SCHED_GROUP_TOP_APP = 3
-     * SCHED_GROUP_TOP_APP_BOUND = 4
-     *
-     * 本模块只区分：
-     *
-     * 0     = 后台
-     * 非 0  = 前台
-     */
+    private static final Object READ_FAILED = new Object();
+
     private static final int SCHED_GROUP_BACKGROUND = 0;
 
     private static final int STATE_UNKNOWN = -1;
     private static final int STATE_FOREGROUND = 0;
     private static final int STATE_BACKGROUND = 1;
 
-    private static final Object READ_FAILED = new Object();
+    private static final int GROUP_UNKNOWN = Integer.MIN_VALUE;
 
     private final ModuleEntry module;
 
@@ -53,7 +47,7 @@ final class SystemServerHookInstaller {
     private final AtomicBoolean fieldErrorLogged =
             new AtomicBoolean(false);
 
-    private final AtomicBoolean groupMethodErrorLogged =
+    private final AtomicBoolean schedulingErrorLogged =
             new AtomicBoolean(false);
 
     private final ThreadPoolExecutor logExecutor;
@@ -64,14 +58,8 @@ final class SystemServerHookInstaller {
                     Locale.US
             );
 
-    private volatile Class<?> processStateRecordClass;
-
-    private volatile Method currentSchedulingGroupMethod;
-
     private volatile int targetSchedulingGroup =
-            Integer.MIN_VALUE;
-
-    private volatile boolean targetBackground;
+            GROUP_UNKNOWN;
 
     SystemServerHookInstaller(
             ModuleEntry module,
@@ -105,113 +93,325 @@ final class SystemServerHookInstaller {
 
     void install() {
 
-        initializeClasses();
+        /*
+         * 前台快速入口。
+         */
+        hookTopAppUpdate();
 
+        /*
+         * 前台可见性快速入口。
+         */
+        hookVisibleRequested();
+
+        /*
+         * 后台判断入口。
+         */
         hookCurrentSchedulingGroup();
+
+        module.safeLog(
+                Log.INFO,
+                "STATE_HOOKS_INSTALL_FINISHED",
+                null
+        );
     }
 
     // ============================================================
-    // 初始化
+    // Hook 1：ATMS.updateTopApp(ActivityRecord)
+    //
+    // 只负责确认前台。
+    //
+    // 当目标应用成为 top-resumed Activity 所属进程时，
+    // 同步输出前台。
+    //
+    // 当目标应用失去 top 身份时，不做后台判断。
     // ============================================================
 
-    private void initializeClasses() {
+    private void hookTopAppUpdate() {
+
+        final Method targetMethod;
 
         try {
-            processStateRecordClass = Class.forName(
+            Class<?> activityRecordClass = Class.forName(
+                    TAG_ACTIVITY,
+                    false,
+                    classLoader
+            );
+
+            Class<?> serviceClass = Class.forName(
+                    TAG_ATMS,
+                    false,
+                    classLoader
+            );
+
+            targetMethod = serviceClass.getDeclaredMethod(
+                    "updateTopApp",
+                    activityRecordClass
+            );
+
+            if (targetMethod.getReturnType() != void.class) {
+                throw new IllegalStateException(
+                        "Invalid updateTopApp return type"
+                );
+            }
+
+            targetMethod.setAccessible(true);
+
+        } catch (Throwable error) {
+
+            module.safeLog(
+                    Log.ERROR,
+                    "TOP_APP_HOOK_FAILED stage=FIND_METHOD",
+                    error
+            );
+
+            return;
+        }
+
+        try {
+            module.hook(targetMethod).intercept(chain -> {
+
+                Object result = chain.proceed();
+
+                try {
+                    Object service = chain.getThisObject();
+
+                    /*
+                     * updateTopApp 执行后，
+                     * mTopApp 就是系统更新后的 top WPC。
+                     */
+                    Object newTopApp = readFieldStrict(
+                            service,
+                            "mTopApp"
+                    );
+
+                    if (newTopApp == READ_FAILED) {
+                        reportFieldError();
+                        return result;
+                    }
+
+                    /*
+                     * 只有目标应用成为 top 时才触发前台。
+                     *
+                     * 目标应用失去 top 身份时不处理，
+                     * 避免小窗失焦被判后台。
+                     */
+                    if (ProcessSnapshot.isTargetWpc(newTopApp)) {
+
+                        publishForeground(
+                                "ATMS.updateTopApp",
+                                GROUP_UNKNOWN
+                        );
+                    }
+
+                } catch (Throwable error) {
+
+                    reportCallbackError(error);
+                }
+
+                return result;
+            });
+
+            module.safeLog(
+                    Log.INFO,
+                    "TOP_APP_HOOK_OK"
+                            + " method=ATMS.updateTopApp"
+                            + " mode=FOREGROUND_ONLY",
+                    null
+            );
+
+        } catch (Throwable error) {
+
+            module.safeLog(
+                    Log.ERROR,
+                    "TOP_APP_HOOK_FAILED stage=REGISTER",
+                    error
+            );
+        }
+    }
+
+    // ============================================================
+    // Hook 2：ActivityRecord.setVisibleRequested(boolean)
+    //
+    // 只捕获目标 Activity 从不可见变为可见。
+    //
+    // 不等待 Task 扫描，也不等待 OOM 调度更新。
+    // ============================================================
+
+    private void hookVisibleRequested() {
+
+        final Method targetMethod;
+
+        try {
+            Class<?> activityRecordClass = Class.forName(
+                    TAG_ACTIVITY,
+                    false,
+                    classLoader
+            );
+
+            targetMethod = activityRecordClass.getDeclaredMethod(
+                    "setVisibleRequested",
+                    boolean.class
+            );
+
+            if (targetMethod.getReturnType() != void.class) {
+                throw new IllegalStateException(
+                        "Invalid setVisibleRequested return type"
+                );
+            }
+
+            targetMethod.setAccessible(true);
+
+        } catch (Throwable error) {
+
+            module.safeLog(
+                    Log.ERROR,
+                    "VISIBLE_REQUESTED_HOOK_FAILED stage=FIND_METHOD",
+                    error
+            );
+
+            return;
+        }
+
+        try {
+            module.hook(targetMethod).intercept(chain -> {
+
+                Object activity = chain.getThisObject();
+
+                Object beforeValue = readFieldStrict(
+                        activity,
+                        "mVisibleRequested"
+                );
+
+                Object result = chain.proceed();
+
+                try {
+                    Object afterValue = readFieldStrict(
+                            activity,
+                            "mVisibleRequested"
+                    );
+
+                    if (!(afterValue instanceof Boolean)) {
+                        return result;
+                    }
+
+                    boolean visible =
+                            ((Boolean) afterValue).booleanValue();
+
+                    if (!visible) {
+                        return result;
+                    }
+
+                    /*
+                     * 已经可见且没有发生变化，
+                     * 不需要重复触发。
+                     */
+                    if (beforeValue instanceof Boolean
+                            && ((Boolean) beforeValue).booleanValue()) {
+
+                        return result;
+                    }
+
+                    Object wpc = readFieldStrict(
+                            activity,
+                            "app"
+                    );
+
+                    if (wpc == READ_FAILED || wpc == null) {
+                        return result;
+                    }
+
+                    if (!ProcessSnapshot.isTargetWpc(wpc)) {
+                        return result;
+                    }
+
+                    /*
+                     * 目标应用可见性变为 true。
+                     *
+                     * 直接更新状态，不等待调度组。
+                     */
+                    publishForeground(
+                            "ActivityRecord.setVisibleRequested",
+                            GROUP_UNKNOWN
+                    );
+
+                } catch (Throwable error) {
+
+                    reportCallbackError(error);
+                }
+
+                return result;
+            });
+
+            module.safeLog(
+                    Log.INFO,
+                    "VISIBLE_REQUESTED_HOOK_OK"
+                            + " method=ActivityRecord."
+                            + "setVisibleRequested"
+                            + " mode=TRUE_ONLY",
+                    null
+            );
+
+        } catch (Throwable error) {
+
+            module.safeLog(
+                    Log.ERROR,
+                    "VISIBLE_REQUESTED_HOOK_FAILED stage=REGISTER",
+                    error
+            );
+        }
+    }
+
+    // ============================================================
+    // Hook 3：ProcessStateRecord.setCurrentSchedulingGroup(int)
+    //
+    // 只用于后台确认和前台兜底。
+    //
+    // group == 0：后台
+    // group != 0：前台
+    //
+    // 前台不再依赖这个 Hook。
+    // ============================================================
+
+    private void hookCurrentSchedulingGroup() {
+
+        final Method targetMethod;
+
+        try {
+            Class<?> stateRecordClass = Class.forName(
                     TAG_PROCESS_STATE_RECORD,
                     false,
                     classLoader
             );
 
-            module.safeLog(
-                    Log.INFO,
-                    "PROCESS_STATE_RECORD_CLASS_INIT_OK",
-                    null
+            targetMethod = stateRecordClass.getDeclaredMethod(
+                    "setCurrentSchedulingGroup",
+                    int.class
             );
 
-        } catch (Throwable error) {
-
-            processStateRecordClass = null;
-
-            module.safeLog(
-                    Log.ERROR,
-                    "PROCESS_STATE_RECORD_CLASS_INIT_FAILED",
-                    error
-            );
-
-            return;
-        }
-
-        try {
-            Method method =
-                    processStateRecordClass.getDeclaredMethod(
-                            "setCurrentSchedulingGroup",
-                            int.class
-                    );
-
-            if (method.getReturnType() != void.class) {
+            if (targetMethod.getReturnType() != void.class) {
                 throw new IllegalStateException(
-                        "Unexpected return type: "
-                                + method.getReturnType()
+                        "Invalid scheduling group return type"
                 );
             }
 
-            method.setAccessible(true);
-
-            currentSchedulingGroupMethod = method;
-
-            module.safeLog(
-                    Log.INFO,
-                    "CURRENT_SCHEDULING_GROUP_METHOD_INIT_OK"
-                            + " method=ProcessStateRecord."
-                            + "setCurrentSchedulingGroup"
-                            + " parameter=int",
-                    null
-            );
+            targetMethod.setAccessible(true);
 
         } catch (Throwable error) {
 
-            currentSchedulingGroupMethod = null;
-
             module.safeLog(
                     Log.ERROR,
-                    "CURRENT_SCHEDULING_GROUP_METHOD_INIT_FAILED",
+                    "SCHEDULING_GROUP_HOOK_FAILED stage=FIND_METHOD",
                     error
-            );
-        }
-    }
-
-    // ============================================================
-    // Hook：ProcessStateRecord.setCurrentSchedulingGroup(int)
-    // ============================================================
-
-    private void hookCurrentSchedulingGroup() {
-
-        if (currentSchedulingGroupMethod == null) {
-
-            module.safeLog(
-                    Log.ERROR,
-                    "SCHEDULING_GROUP_HOOK_SKIPPED"
-                            + " reason=METHOD_MISSING",
-                    null
             );
 
             return;
         }
 
         try {
-            module.hook(
-                    currentSchedulingGroupMethod
-            ).intercept(chain -> {
+            module.hook(targetMethod).intercept(chain -> {
 
                 Object stateRecord = chain.getThisObject();
 
-                /*
-                 * mApp 是 ProcessStateRecord 对应的
-                 * ProcessRecord。
-                 *
-                 * 在执行原方法前取得对象引用。
-                 */
                 Object processRecord = readFieldStrict(
                         stateRecord,
                         "mApp"
@@ -226,9 +426,6 @@ final class SystemServerHookInstaller {
                         return result;
                     }
 
-                    /*
-                     * 先确认属于目标应用。
-                     */
                     if (!ProcessSnapshot.isTargetProcessRecord(
                             processRecord
                     )) {
@@ -237,10 +434,9 @@ final class SystemServerHookInstaller {
                     }
 
                     /*
-                     * 只使用目标应用主进程。
+                     * 只监听主进程。
                      *
-                     * 不让同一应用的辅助进程调度组
-                     * 覆盖主进程的前后台判断。
+                     * 避免辅助进程状态覆盖主进程。
                      */
                     String processName =
                             SafeReflection.readString(
@@ -255,31 +451,20 @@ final class SystemServerHookInstaller {
                         return result;
                     }
 
-                    /*
-                     * 原方法已经执行完成。
-                     *
-                     * 直接读取它刚刚更新的 mCurSchedGroup，
-                     * 不依赖 chain 参数接口。
-                     */
                     Object groupValue = readFieldStrict(
                             stateRecord,
                             "mCurSchedGroup"
                     );
 
                     if (!(groupValue instanceof Number)) {
-
-                        reportFieldError();
-
+                        reportSchedulingError();
                         return result;
                     }
 
-                    int schedulingGroup =
+                    int group =
                             ((Number) groupValue).intValue();
 
-                    handleSchedulingGroupChange(
-                            schedulingGroup,
-                            processName
-                    );
+                    handleSchedulingGroup(group);
 
                 } catch (Throwable error) {
 
@@ -294,9 +479,8 @@ final class SystemServerHookInstaller {
                     "SCHEDULING_GROUP_HOOK_OK"
                             + " method=ProcessStateRecord."
                             + "setCurrentSchedulingGroup"
-                            + " backgroundValue="
-                            + SCHED_GROUP_BACKGROUND
-                            + " mode=BACKGROUND_ONLY",
+                            + " backgroundValue=0"
+                            + " mode=BACKGROUND_CONFIRM",
                     null
             );
 
@@ -311,70 +495,127 @@ final class SystemServerHookInstaller {
     }
 
     // ============================================================
-    // 前后台判断
+    // 调度组处理
     // ============================================================
 
-    private void handleSchedulingGroupChange(
-            int schedulingGroup,
-            String processName
+    private void handleSchedulingGroup(int group) {
+
+        targetSchedulingGroup = group;
+
+        if (group == SCHED_GROUP_BACKGROUND) {
+
+            publishBackground(
+                    "ProcessStateRecord.setCurrentSchedulingGroup",
+                    group
+            );
+
+        } else {
+
+            /*
+             * 非 0 组是前台调度组。
+             *
+             * 这里仅作为兜底。
+             * 正常前台应当由 updateTopApp 或
+             * setVisibleRequested 更早触发。
+             */
+            publishForeground(
+                    "ProcessStateRecord.setCurrentSchedulingGroup",
+                    group
+            );
+        }
+    }
+
+    // ============================================================
+    // 状态发布
+    // ============================================================
+
+    private void publishForeground(
+            String source,
+            int group
     ) {
 
-        targetSchedulingGroup = schedulingGroup;
+        publishState(
+                STATE_FOREGROUND,
+                source,
+                group
+        );
+    }
 
-        /*
-         * 唯一判定规则：
-         *
-         * group == 0：后台
-         * group != 0：前台
-         *
-         * 不考虑 top-app 身份。
-         * 不考虑 Task visibility。
-         * 不考虑 ActivityRecord 可见性。
-         */
-        boolean background =
-                schedulingGroup == SCHED_GROUP_BACKGROUND;
+    private void publishBackground(
+            String source,
+            int group
+    ) {
 
-        targetBackground = background;
+        publishState(
+                STATE_BACKGROUND,
+                source,
+                group
+        );
+    }
 
-        int state = background
-                ? STATE_BACKGROUND
-                : STATE_FOREGROUND;
+    private void publishState(
+            int state,
+            String source,
+            int eventGroup
+    ) {
 
         int previous = lastReportedState.getAndSet(state);
 
         /*
-         * 同一状态不重复输出。
+         * 状态未变化，不重复输出。
          */
         if (previous == state) {
             return;
         }
 
-        String label = background
-                ? "[后台]"
-                : "[前台]";
+        String label = state == STATE_FOREGROUND
+                ? "[前台]"
+                : "[后台]";
+
+        String groupText;
+
+        if (eventGroup == GROUP_UNKNOWN) {
+
+            groupText = "unknown";
+
+        } else {
+
+            groupText =
+                    eventGroup
+                            + "("
+                            + getSchedulingGroupName(eventGroup)
+                            + ")";
+        }
 
         String message =
                 label
                         + " package="
                         + ProcessSnapshot.TARGET_PACKAGE
-                        + " process="
-                        + processName
                         + " schedGroup="
-                        + schedulingGroup
-                        + " schedGroupName="
-                        + getSchedulingGroupName(
-                                schedulingGroup
-                        )
+                        + groupText
+                        + " lastSchedGroup="
+                        + formatGroup(targetSchedulingGroup)
                         + " source="
-                        + "ProcessStateRecord.setCurrentSchedulingGroup";
+                        + source;
 
+        /*
+         * 状态机在 Hook 回调中同步更新。
+         * 日志异步输出，不阻塞 system_server。
+         */
         postLog(
                 System.currentTimeMillis(),
                 message
         );
     }
 
-    private String getSchedulingGroupName(int group) {
+    private static String formatGroup(int group) {
+
+        return group == GROUP_UNKNOWN
+                ? "unknown"
+                : Integer.toString(group);
+    }
+
+    private static String getSchedulingGroupName(int group) {
 
         switch (group) {
 
@@ -399,7 +640,7 @@ final class SystemServerHookInstaller {
     }
 
     // ============================================================
-    // 反射
+    // 严格反射
     // ============================================================
 
     private static Object readFieldStrict(
@@ -464,7 +705,7 @@ final class SystemServerHookInstaller {
 
         module.safeLog(
                 Log.ERROR,
-                "SCHEDULING_GROUP_FIELD_READ_FAILED",
+                "STATE_FIELD_READ_FAILED",
                 null
         );
     }
@@ -477,8 +718,21 @@ final class SystemServerHookInstaller {
 
         module.safeLog(
                 Log.ERROR,
-                "SCHEDULING_GROUP_CALLBACK_ERROR",
+                "STATE_CALLBACK_ERROR",
                 error
+        );
+    }
+
+    private void reportSchedulingError() {
+
+        if (!schedulingErrorLogged.compareAndSet(false, true)) {
+            return;
+        }
+
+        module.safeLog(
+                Log.ERROR,
+                "SCHEDULING_GROUP_READ_FAILED",
+                null
         );
     }
 
